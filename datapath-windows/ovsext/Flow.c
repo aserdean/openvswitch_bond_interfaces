@@ -95,7 +95,7 @@ static NTSTATUS OvsDoDumpFlows(OvsFlowDumpInput *dumpInput,
 
 /* For Parsing attributes in FLOW_* commands */
 const NL_POLICY nlFlowPolicy[] = {
-    [OVS_FLOW_ATTR_KEY] = {.type = NL_A_NESTED, .optional = FALSE},
+    [OVS_FLOW_ATTR_KEY] = {.type = NL_A_NESTED, .optional = TRUE},
     [OVS_FLOW_ATTR_MASK] = {.type = NL_A_NESTED, .optional = TRUE},
     [OVS_FLOW_ATTR_ACTIONS] = {.type = NL_A_NESTED, .optional = TRUE},
     [OVS_FLOW_ATTR_STATS] = {.type = NL_A_UNSPEC,
@@ -308,6 +308,12 @@ OvsFlowNlCmdHandler(POVS_USER_PARAMS_CONTEXT usrParamsCtx,
        goto done;
     }
 
+	if (!nlAttrs[OVS_FLOW_ATTR_KEY]) {
+		nlError = NL_ERROR_INVAL;
+		OVS_LOG_ERROR("OVS_FLOW_ATTR_KEY missing from flow");
+		goto done;
+	}
+
     if ((rc = _MapNlToFlowPut(msgIn, nlAttrs[OVS_FLOW_ATTR_KEY],
          nlAttrs[OVS_FLOW_ATTR_ACTIONS], nlAttrs[OVS_FLOW_ATTR_CLEAR],
          &mappedFlow))
@@ -454,6 +460,18 @@ _FlowNlGetCmdHandler(POVS_USER_PARAMS_CONTEXT usrParamsCtx,
         rc = STATUS_INVALID_PARAMETER;
         goto done;
     }
+
+	if (!nlAttrs[OVS_FLOW_ATTR_KEY]) {
+		rc = STATUS_SUCCESS;
+		NL_ERROR nlError = NL_ERROR_INVAL;
+		OVS_LOG_ERROR("OVS_FLOW_ATTR_KEY missing from flow");
+		POVS_MESSAGE_ERROR msgError = (POVS_MESSAGE_ERROR)
+			usrParamsCtx->outputBuffer;
+		NlBuildErrorMsg(msgIn, msgError, nlError);
+		*replyLen = msgError->nlMsg.nlmsgLen;
+		rc = STATUS_SUCCESS;
+		goto done;
+	}
 
     keyAttrOffset = (UINT32)((PCHAR) nlAttrs[OVS_FLOW_ATTR_KEY] -
                     (PCHAR)nlMsgHdr);
