@@ -65,11 +65,361 @@ static NTSTATUS CreateNetlinkMesgForNetdev(POVS_VPORT_EXT_INFO info,
                                            PVOID outBuffer,
                                            UINT32 outBufLen,
                                            int dpIfIndex);
-static POVS_VPORT_ENTRY OvsFindVportByHvNameW(POVS_SWITCH_CONTEXT switchContext,
-                                              PWSTR wsName, SIZE_T wstrSize);
-static NDIS_STATUS InitHvVportCommon(POVS_SWITCH_CONTEXT switchContext,
-                                     POVS_VPORT_ENTRY vport,
-                                     BOOLEAN newPort);
+static VOID
+BuildMsgOut(POVS_MESSAGE msgIn, POVS_MESSAGE msgOut, UINT16 type,
+UINT32 length, UINT16 flags)
+{
+	msgOut->nlMsg.nlmsgType = type;
+	msgOut->nlMsg.nlmsgFlags = flags;
+	msgOut->nlMsg.nlmsgSeq = msgIn->nlMsg.nlmsgSeq;
+	msgOut->nlMsg.nlmsgPid = msgIn->nlMsg.nlmsgPid;
+	msgOut->nlMsg.nlmsgLen = length;
+
+	msgOut->genlMsg.cmd = msgIn->genlMsg.cmd;
+	msgOut->genlMsg.version = msgIn->genlMsg.version;
+	msgOut->genlMsg.reserved = 0;
+}
+
+VOID
+BuildReplyMsgFromMsgIn(POVS_MESSAGE msgIn, POVS_MESSAGE msgOut, UINT16 flags)
+{
+	BuildMsgOut(msgIn, msgOut, msgIn->nlMsg.nlmsgType, sizeof(OVS_MESSAGE),
+		flags);
+}
+
+
+static UINT32
+OvsComputeVportNo(POVS_SWITCH_CONTEXT switchContext)
+{
+	/* we are not allowed to create the port OVS_DPPORT_NUMBER_LOCAL */
+	for (ULONG i = OVS_DPPORT_NUMBER_LOCAL + 1; i < MAXUINT16; ++i) {
+		POVS_VPORT_ENTRY vport;
+
+		vport = OvsFindVportByPortNo(switchContext, i);
+		if (!vport) {
+			return i;
+		}
+	}
+
+	return OVS_DPPORT_NUMBER_INVALID;
+}
+
+VOID
+BuildErrorMsg(POVS_MESSAGE msgIn, POVS_MESSAGE_ERROR msgOut, UINT errorCode)
+{
+	BuildMsgOut(msgIn, (POVS_MESSAGE)msgOut, NLMSG_ERROR,
+		sizeof(OVS_MESSAGE_ERROR), 0);
+
+	msgOut->errorMsg.error = errorCode;
+	msgOut->errorMsg.nlMsg = msgIn->nlMsg;
+}
+static NTSTATUS
+OvsCreateMsgFromVport(POVS_VPORT_ENTRY vport,
+POVS_MESSAGE msgIn,
+PVOID outBuffer,
+UINT32 outBufLen,
+int dpIfIndex)
+{
+	NL_BUFFER nlBuffer;
+	OVS_VPORT_FULL_STATS vportStats;
+	BOOLEAN ok;
+	OVS_MESSAGE msgOut;
+	PNL_MSG_HDR nlMsg;
+
+	NlBufInit(&nlBuffer, outBuffer, outBufLen);
+
+	BuildReplyMsgFromMsgIn(msgIn, &msgOut, NLM_F_MULTI);
+	msgOut.ovsHdr.dp_ifindex = dpIfIndex;
+
+	ok = NlMsgPutHead(&nlBuffer, (PCHAR)&msgOut, sizeof msgOut);
+	if (!ok) {
+		return STATUS_INSUFFICIENT_RESOURCES;
+	}
+
+	ok = NlMsgPutTailU32(&nlBuffer, OVS_VPORT_ATTR_PORT_NO, vport->portNo);
+	if (!ok) {
+		return STATUS_INSUFFICIENT_RESOURCES;
+	}
+
+	ok = NlMsgPutTailU32(&nlBuffer, OVS_VPORT_ATTR_TYPE, vport->ovsType);
+	if (!ok) {
+		return STATUS_INSUFFICIENT_RESOURCES;
+	}
+
+	ok = NlMsgPutTailString(&nlBuffer, OVS_VPORT_ATTR_NAME, vport->ovsName);
+	if (!ok) {
+		return STATUS_INSUFFICIENT_RESOURCES;
+	}
+
+	/*
+	* XXX: when we implement OVS_DP_ATTR_USER_FEATURES in datapath,
+	* we'll need to check the OVS_DP_F_VPORT_PIDS flag: if it is set,
+	* it means we have an array of pids, instead of a single pid.
+	* ATM we assume we have one pid only.
+	*/
+
+	ok = NlMsgPutTailU32(&nlBuffer, OVS_VPORT_ATTR_UPCALL_PID,
+		vport->upcallPid);
+	if (!ok) {
+		return STATUS_INSUFFICIENT_RESOURCES;
+	}
+
+	/*stats*/
+	vportStats.rxPackets = vport->stats.rxPackets;
+	vportStats.rxBytes = vport->stats.rxBytes;
+	vportStats.txPackets = vport->stats.txPackets;
+	vportStats.txBytes = vport->stats.txBytes;
+	vportStats.rxErrors = vport->errStats.rxErrors;
+	vportStats.txErrors = vport->errStats.txErrors;
+	vportStats.rxDropped = vport->errStats.rxDropped;
+	vportStats.txDropped = vport->errStats.txDropped;
+
+	ok = NlMsgPutTailUnspec(&nlBuffer, OVS_VPORT_ATTR_STATS,
+		(PCHAR)&vportStats,
+		sizeof(OVS_VPORT_FULL_STATS));
+	if (!ok) {
+		return STATUS_INSUFFICIENT_RESOURCES;
+	}
+
+	/*
+	* XXX: when vxlan udp dest port becomes configurable, we will also need
+	* to add vport options
+	*/
+
+	nlMsg = (PNL_MSG_HDR)NlBufAt(&nlBuffer, 0, 0);
+	nlMsg->nlmsgLen = NlBufSize(&nlBuffer);
+
+	return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+OvsGetVport(POVS_USER_PARAMS_CONTEXT usrParamsCtx,
+UINT32 *replyLen)
+{
+	NTSTATUS status = STATUS_SUCCESS;
+	LOCK_STATE_EX lockState;
+
+	POVS_MESSAGE msgIn = (POVS_MESSAGE)usrParamsCtx->inputBuffer;
+	POVS_MESSAGE msgOut = (POVS_MESSAGE)usrParamsCtx->outputBuffer;
+	POVS_VPORT_ENTRY vport = NULL;
+	NL_ERROR nlError = NL_ERROR_SUCCESS;
+	PCHAR portName = NULL;
+	UINT32 portNameLen = 0;
+	UINT32 portNumber = OVS_DPPORT_NUMBER_INVALID;
+
+	static const NL_POLICY ovsVportPolicy[] = {
+		[OVS_VPORT_ATTR_PORT_NO] = { .type = NL_A_U32, .optional = TRUE },
+		[OVS_VPORT_ATTR_NAME] = { .type = NL_A_STRING,
+		.minLen = 2,
+		.maxLen = IFNAMSIZ,
+		.optional = TRUE },
+	};
+	PNL_ATTR vportAttrs[ARRAY_SIZE(ovsVportPolicy)];
+
+	/* input buffer has been validated while validating write dev op. */
+	ASSERT(usrParamsCtx->inputBuffer != NULL);
+
+	if (!NlAttrParse((PNL_MSG_HDR)msgIn,
+		NLMSG_HDRLEN + GENL_HDRLEN + OVS_HDRLEN,
+		NlMsgAttrsLen((PNL_MSG_HDR)msgIn),
+		ovsVportPolicy, vportAttrs, ARRAY_SIZE(vportAttrs))) {
+		return STATUS_INVALID_PARAMETER;
+	}
+
+	if (msgOut == NULL || usrParamsCtx->outputLength < sizeof *msgOut) {
+		return STATUS_INVALID_BUFFER_SIZE;
+	}
+
+	NdisAcquireRWLockRead(gOvsSwitchContext->dispatchLock, &lockState, 0);
+	if (vportAttrs[OVS_VPORT_ATTR_NAME] != NULL) {
+		portName = NlAttrGet(vportAttrs[OVS_VPORT_ATTR_NAME]);
+		portNameLen = NlAttrGetSize(vportAttrs[OVS_VPORT_ATTR_NAME]);
+
+		/* the port name is expected to be null-terminated */
+		ASSERT(portName[portNameLen - 1] == '\0');
+
+		vport = OvsFindVportByOvsName(gOvsSwitchContext, portName);
+	}
+	else if (vportAttrs[OVS_VPORT_ATTR_PORT_NO] != NULL) {
+		portNumber = NlAttrGetU32(vportAttrs[OVS_VPORT_ATTR_PORT_NO]);
+
+		vport = OvsFindVportByPortNo(gOvsSwitchContext, portNumber);
+	}
+	else {
+		nlError = NL_ERROR_INVAL;
+		NdisReleaseRWLock(gOvsSwitchContext->dispatchLock, &lockState);
+		goto Cleanup;
+	}
+
+	if (!vport) {
+		nlError = NL_ERROR_NODEV;
+		NdisReleaseRWLock(gOvsSwitchContext->dispatchLock, &lockState);
+		goto Cleanup;
+	}
+
+	status = OvsCreateMsgFromVport(vport, msgIn, usrParamsCtx->outputBuffer,
+		usrParamsCtx->outputLength,
+		gOvsSwitchContext->dpNo);
+	NdisReleaseRWLock(gOvsSwitchContext->dispatchLock, &lockState);
+
+	*replyLen = msgOut->nlMsg.nlmsgLen;
+
+Cleanup:
+	if (nlError != NL_ERROR_SUCCESS) {
+		POVS_MESSAGE_ERROR msgError = (POVS_MESSAGE_ERROR)
+			usrParamsCtx->outputBuffer;
+
+		BuildErrorMsg(msgIn, msgError, nlError);
+		*replyLen = msgError->nlMsg.nlmsgLen;
+	}
+
+	return STATUS_SUCCESS;
+}
+static NTSTATUS
+OvsGetVportDumpNext(POVS_USER_PARAMS_CONTEXT usrParamsCtx,
+UINT32 *replyLen)
+{
+	POVS_MESSAGE msgIn;
+	POVS_OPEN_INSTANCE instance =
+		(POVS_OPEN_INSTANCE)usrParamsCtx->ovsInstance;
+	LOCK_STATE_EX lockState;
+	UINT32 i = OVS_MAX_VPORT_ARRAY_SIZE;
+
+	/*
+	* XXX: this function shares some code with other dump command(s).
+	* In the future, we will need to refactor the dump functions
+	*/
+
+	ASSERT(usrParamsCtx->devOp == OVS_READ_DEV_OP);
+
+	if (instance->dumpState.ovsMsg == NULL) {
+		ASSERT(FALSE);
+		return STATUS_INVALID_DEVICE_STATE;
+	}
+
+	/* Output buffer has been validated while validating read dev op. */
+	ASSERT(usrParamsCtx->outputBuffer != NULL);
+
+	msgIn = instance->dumpState.ovsMsg;
+
+	OvsAcquireCtrlLock();
+
+	/*
+	* XXX: when we implement OVS_DP_ATTR_USER_FEATURES in datapath,
+	* we'll need to check the OVS_DP_F_VPORT_PIDS flag: if it is set,
+	* it means we have an array of pids, instead of a single pid.
+	* ATM we assume we have one pid only.
+	*/
+	ASSERT(KeGetCurrentIrql() == DISPATCH_LEVEL);
+	NdisAcquireRWLockRead(gOvsSwitchContext->dispatchLock, &lockState,
+		NDIS_RWL_AT_DISPATCH_LEVEL);
+
+	if (gOvsSwitchContext->numHvVports > 0 ||
+		gOvsSwitchContext->numNonHvVports > 0) {
+		/* inBucket: the bucket, used for lookup */
+		UINT32 inBucket = instance->dumpState.index[0];
+		/* inIndex: index within the given bucket, used for lookup */
+		UINT32 inIndex = instance->dumpState.index[1];
+		/* the bucket to be used for the next dump operation */
+		UINT32 outBucket = 0;
+		/* the index within the outBucket to be used for the next dump */
+		UINT32 outIndex = 0;
+
+		for (i = inBucket; i < OVS_MAX_VPORT_ARRAY_SIZE; i++) {
+			PLIST_ENTRY head, link;
+			head = &(gOvsSwitchContext->portNoHashArray[i]);
+			POVS_VPORT_ENTRY vport = NULL;
+
+			outIndex = 0;
+			LIST_FORALL(head, link) {
+
+				/*
+				* if one or more dumps were previously done on this same bucket,
+				* inIndex will be > 0, so we'll need to reply with the
+				* inIndex + 1 vport from the bucket.
+				*/
+				if (outIndex >= inIndex) {
+					vport = CONTAINING_RECORD(link, OVS_VPORT_ENTRY, portNoLink);
+
+					ASSERT(vport->portNo != OVS_DPPORT_NUMBER_INVALID);
+					OvsCreateMsgFromVport(vport, msgIn,
+						usrParamsCtx->outputBuffer,
+						usrParamsCtx->outputLength,
+						gOvsSwitchContext->dpNo);
+					++outIndex;
+					break;
+				}
+
+				++outIndex;
+			}
+
+			if (vport) {
+				break;
+			}
+
+			/*
+			* if no vport was found above, check the next bucket, beginning
+			* with the first (i.e. index 0) elem from within that bucket
+			*/
+			inIndex = 0;
+		}
+
+		outBucket = i;
+
+		/* XXX: what about NLMSG_DONE (as msg type)? */
+		instance->dumpState.index[0] = outBucket;
+		instance->dumpState.index[1] = outIndex;
+	}
+
+	NdisReleaseRWLock(gOvsSwitchContext->dispatchLock, &lockState);
+
+	OvsReleaseCtrlLock();
+
+	/* if i < OVS_MAX_VPORT_ARRAY_SIZE => vport was found */
+	if (i < OVS_MAX_VPORT_ARRAY_SIZE) {
+		POVS_MESSAGE msgOut = (POVS_MESSAGE)usrParamsCtx->outputBuffer;
+		*replyLen = msgOut->nlMsg.nlmsgLen;
+	}
+	else {
+		/*
+		* if i >= OVS_MAX_VPORT_ARRAY_SIZE => vport was not found =>
+		* it's dump done
+		*/
+		*replyLen = 0;
+		/* Free up the dump state, since there's no more data to continue. */
+		FreeUserDumpState(instance);
+	}
+
+	return STATUS_SUCCESS;
+}
+/*
+* --------------------------------------------------------------------------
+*  Handler for the get vport command. The function handles the initial call to
+*  setup the dump state, as well as subsequent calls to continue dumping data.
+* --------------------------------------------------------------------------
+*/
+ NTSTATUS
+OvsGetVportCmdHandler(POVS_USER_PARAMS_CONTEXT usrParamsCtx,
+UINT32 *replyLen)
+{
+	*replyLen = 0;
+
+	switch (usrParamsCtx->devOp)
+	{
+	case OVS_WRITE_DEV_OP:
+		return OvsSetupDumpStart(usrParamsCtx);
+
+	case OVS_READ_DEV_OP:
+		return OvsGetVportDumpNext(usrParamsCtx, replyLen);
+
+	case OVS_TRANSACTION_DEV_OP:
+		return OvsGetVport(usrParamsCtx, replyLen);
+
+	default:
+		return STATUS_INVALID_DEVICE_REQUEST;
+	}
+
+}
 
 /*
  * Functions implemented in relaton to NDIS port manipulation.
@@ -81,63 +431,25 @@ HvCreatePort(POVS_SWITCH_CONTEXT switchContext,
     POVS_VPORT_ENTRY vport;
     LOCK_STATE_EX lockState;
     NDIS_STATUS status = NDIS_STATUS_SUCCESS;
-    BOOLEAN newPort = FALSE;
 
     VPORT_PORT_ENTER(portParam);
 
     NdisAcquireRWLockWrite(switchContext->dispatchLock, &lockState, 0);
-    /* Lookup by port ID. */
     vport = OvsFindVportByPortIdAndNicIndex(switchContext,
                                             portParam->PortId, 0);
-    if (vport != NULL) {
-        OVS_LOG_ERROR("Port add failed due to duplicate port name, "
-                      "port Id: %u", portParam->PortId);
+    if (vport != NULL && !vport->hvDeleted) {
         status = STATUS_DATA_NOT_ACCEPTED;
         goto create_port_done;
-    }
-
-    /*
-     * Lookup by port name to see if this port with this name had been added
-     * (and deleted) previously.
-     */
-    vport = OvsFindVportByHvNameW(gOvsSwitchContext,
-                                  portParam->PortFriendlyName.String,
-                                  portParam->PortFriendlyName.Length);
-    if (vport && vport->isPresentOnHv == FALSE) {
-        OVS_LOG_ERROR("Port add failed since a port already exists on "
-                      "the specified port Id: %u, ovsName: %s",
-                      portParam->PortId, vport->ovsName);
-        status = STATUS_DATA_NOT_ACCEPTED;
-        goto create_port_done;
-    }
-
-    if (vport != NULL) {
-        ASSERT(vport->isPresentOnHv);
-        ASSERT(vport->portNo != OVS_DPPORT_NUMBER_INVALID);
-
-        /*
-         * It should be possible to simply just mark this port as "not deleted"
-         * given that the port Id and the name are the same and also provided
-         * that the other properties that we cache have not changed.
-         */
-        if (vport->portType != portParam->PortType) {
-            OVS_LOG_INFO("Port add failed due to PortType change, port Id: %u"
-                         " old: %u, new: %u", portParam->PortId,
-                         vport->portType, portParam->PortType);
-            status = STATUS_DATA_NOT_ACCEPTED;
-            goto create_port_done;
-        }
-        vport->isPresentOnHv = FALSE;
-    } else {
+    } else if (!vport) {
         vport = (POVS_VPORT_ENTRY)OvsAllocateVport();
         if (vport == NULL) {
             status = NDIS_STATUS_RESOURCES;
             goto create_port_done;
         }
-        newPort = TRUE;
     }
+
     OvsInitVportWithPortParam(vport, portParam);
-    InitHvVportCommon(switchContext, vport, newPort);
+    InitHvVportCommon(switchContext, vport);
 
 create_port_done:
     NdisReleaseRWLock(switchContext->dispatchLock, &lockState);
@@ -215,7 +527,8 @@ HvTeardownPort(POVS_SWITCH_CONTEXT switchContext,
     vport = OvsFindVportByPortIdAndNicIndex(switchContext,
                                             portParam->PortId, 0);
     if (vport) {
-        /* add assertion here */
+        /* add assertion here
+         */
         vport->portState = NdisSwitchPortStateTeardown;
         vport->ovsState = OVS_STATE_PORT_TEAR_DOWN;
     } else {
@@ -225,6 +538,7 @@ HvTeardownPort(POVS_SWITCH_CONTEXT switchContext,
 
     VPORT_PORT_EXIT(portParam);
 }
+
 
 
 VOID
@@ -247,7 +561,11 @@ HvDeletePort(POVS_SWITCH_CONTEXT switchContext,
      * delete will delete the vport.
     */
     if (vport) {
-        OvsRemoveAndDeleteVport(switchContext, vport, TRUE, FALSE, NULL);
+        if (vport->portNo == OVS_DPPORT_NUMBER_INVALID) {
+            OvsRemoveAndDeleteVport(switchContext, vport);
+        } else {
+            vport->hvDeleted = TRUE;
+        }
     } else {
         OVS_LOG_WARN("Vport not present.");
     }
@@ -304,7 +622,7 @@ HvCreateNic(POVS_SWITCH_CONTEXT switchContext,
             goto add_nic_done;
         }
         OvsInitPhysNicVport(vport, virtExtVport, nicParam->NicIndex);
-        status = InitHvVportCommon(switchContext, vport, TRUE);
+        status = InitHvVportCommon(switchContext, vport);
         if (status != NDIS_STATUS_SUCCESS) {
             OvsFreeMemory(vport);
             goto add_nic_done;
@@ -537,7 +855,7 @@ HvDeleteNic(POVS_SWITCH_CONTEXT switchContext,
     portNo = vport->portNo;
     if (vport->portType == NdisSwitchPortTypeExternal &&
         vport->nicIndex != 0) {
-        OvsRemoveAndDeleteVport(switchContext, vport, TRUE, FALSE, NULL);
+        OvsRemoveAndDeleteVport(switchContext, vport);
     }
     vport->nicState = NdisSwitchNicStateUnknown;
     vport->ovsState = OVS_STATE_PORT_CREATED;
@@ -597,12 +915,23 @@ OvsFindVportByOvsName(POVS_SWITCH_CONTEXT switchContext,
 
 /* OvsFindVportByHvName: "name" is assumed to be null-terminated */
 POVS_VPORT_ENTRY
-OvsFindVportByHvNameW(POVS_SWITCH_CONTEXT switchContext,
-                      PWSTR wsName, SIZE_T wstrSize)
+OvsFindVportByHvName(POVS_SWITCH_CONTEXT switchContext,
+                     PSTR name)
 {
     POVS_VPORT_ENTRY vport = NULL;
     PLIST_ENTRY head, link;
+    /* 'portFriendlyName' is not NUL-terminated. */
+    SIZE_T length = strlen(name);
+    SIZE_T wstrSize = length * sizeof(WCHAR);
     UINT i;
+
+    PWSTR wsName = OvsAllocateMemory(wstrSize);
+    if (!wsName) {
+        return NULL;
+    }
+    for (i = 0; i < length; i++) {
+        wsName[i] = name[i];
+    }
 
     for (i = 0; i < OVS_MAX_VPORT_ARRAY_SIZE; i++) {
         head = &(switchContext->portIdHashArray[i]);
@@ -624,49 +953,9 @@ OvsFindVportByHvNameW(POVS_SWITCH_CONTEXT switchContext,
         }
     }
 
-    /*
-     * Look in the list of ports that were added from the Hyper-V switch and
-     * deleted.
-     */
-    if (vport == NULL) {
-        for (i = 0; i < OVS_MAX_VPORT_ARRAY_SIZE; i++) {
-            head = &(switchContext->portNoHashArray[i]);
-            LIST_FORALL(head, link) {
-                vport = CONTAINING_RECORD(link, OVS_VPORT_ENTRY, portNoLink);
-                if (vport->portFriendlyName.Length == wstrSize &&
-                    RtlEqualMemory(wsName, vport->portFriendlyName.String,
-                                   vport->portFriendlyName.Length)) {
-                    goto Cleanup;
-                }
-
-                vport = NULL;
-            }
-        }
-    }
-
 Cleanup:
-    return vport;
-}
-
-POVS_VPORT_ENTRY
-OvsFindVportByHvNameA(POVS_SWITCH_CONTEXT switchContext,
-                      PSTR name)
-{
-    POVS_VPORT_ENTRY vport = NULL;
-    /* 'portFriendlyName' is not NUL-terminated. */
-    SIZE_T length = strlen(name);
-    SIZE_T wstrSize = length * sizeof(WCHAR);
-    UINT i;
-
-    PWSTR wsName = OvsAllocateMemory(wstrSize);
-    if (!wsName) {
-        return NULL;
-    }
-    for (i = 0; i < length; i++) {
-        wsName[i] = name[i];
-    }
-    vport = OvsFindVportByHvNameW(switchContext, wsName, wstrSize);
     OvsFreeMemory(wsName);
+
     return vport;
 }
 
@@ -709,7 +998,7 @@ OvsAllocateVport(VOID)
     }
     RtlZeroMemory(vport, sizeof (OVS_VPORT_ENTRY));
     vport->ovsState = OVS_STATE_UNKNOWN;
-    vport->isPresentOnHv = FALSE;
+    vport->hvDeleted = FALSE;
     vport->portNo = OVS_DPPORT_NUMBER_INVALID;
 
     InitializeListHead(&vport->ovsNameLink);
@@ -935,12 +1224,12 @@ AssignNicNameSpecial(POVS_VPORT_ENTRY vport)
  * For external NIC, assigns the name for the NIC.
  * --------------------------------------------------------------------------
  */
-static NDIS_STATUS
+NDIS_STATUS
 InitHvVportCommon(POVS_SWITCH_CONTEXT switchContext,
-                  POVS_VPORT_ENTRY vport,
-                  BOOLEAN newPort)
+                  POVS_VPORT_ENTRY vport)
 {
     UINT32 hash;
+    ASSERT(vport->portNo == OVS_DPPORT_NUMBER_INVALID);
 
     switch (vport->portType) {
     case NdisSwitchPortTypeExternal:
@@ -989,9 +1278,7 @@ InitHvVportCommon(POVS_SWITCH_CONTEXT switchContext,
     hash = OvsJhashWords(&vport->portId, 1, OVS_HASH_BASIS);
     InsertHeadList(&switchContext->portIdHashArray[hash & OVS_VPORT_MASK],
                    &vport->portIdLink);
-    if (newPort) {
-        switchContext->numHvVports++;
-    }
+    switchContext->numHvVports++;
     return NDIS_STATUS_SUCCESS;
 }
 
@@ -1035,9 +1322,8 @@ InitOvsVportCommon(POVS_SWITCH_CONTEXT switchContext,
 
     hash = OvsJhashBytes(vport->ovsName, strlen(vport->ovsName) + 1,
                          OVS_HASH_BASIS);
-    InsertHeadList(
-        &gOvsSwitchContext->ovsPortNameHashArray[hash & OVS_VPORT_MASK],
-        &vport->ovsNameLink);
+    InsertHeadList(&gOvsSwitchContext->ovsPortNameHashArray[hash & OVS_VPORT_MASK],
+                   &vport->ovsNameLink);
 
     return STATUS_SUCCESS;
 }
@@ -1047,26 +1333,13 @@ InitOvsVportCommon(POVS_SWITCH_CONTEXT switchContext,
  * --------------------------------------------------------------------------
  * Provides functionality that is partly complementatry to
  * InitOvsVportCommon()/InitHvVportCommon().
- *
- * 'hvDelete' indicates if caller is removing the vport as a result of the
- * port being removed on the Hyper-V switch.
- * 'ovsDelete' indicates if caller is removing the vport as a result of the
- * port being removed from OVS userspace.
  * --------------------------------------------------------------------------
  */
 VOID
 OvsRemoveAndDeleteVport(POVS_SWITCH_CONTEXT switchContext,
-                        POVS_VPORT_ENTRY vport,
-                        BOOLEAN hvDelete,
-                        BOOLEAN ovsDelete,
-                        BOOLEAN *vportDeallocated)
+                        POVS_VPORT_ENTRY vport)
 {
     BOOLEAN hvSwitchPort = FALSE;
-    BOOLEAN deletedOnOvs = FALSE, deletedOnHv = FALSE;
-
-    if (vportDeallocated) {
-        *vportDeallocated = FALSE;
-    }
 
     if (vport->isExternal) {
         if (vport->nicIndex == 0) {
@@ -1074,9 +1347,6 @@ OvsRemoveAndDeleteVport(POVS_SWITCH_CONTEXT switchContext,
             switchContext->virtualExternalPortId = 0;
             switchContext->virtualExternalVport = NULL;
             OvsFreeMemory(vport);
-            if (vportDeallocated) {
-                *vportDeallocated = TRUE;
-            }
             return;
         } else {
             ASSERT(switchContext->numPhysicalNics);
@@ -1107,56 +1377,17 @@ OvsRemoveAndDeleteVport(POVS_SWITCH_CONTEXT switchContext,
         break;
     }
 
-    /*
-     * 'hvDelete' == TRUE indicates that the port should be removed from the
-     * 'portIdHashArray', while 'ovsDelete' == TRUE indicates that the port
-     * should be removed from 'portNoHashArray' and the 'ovsPortNameHashArray'.
-     *
-     * Both 'hvDelete' and 'ovsDelete' can be set to TRUE by the caller.
-     */
-    if (vport->isPresentOnHv == TRUE) {
-        deletedOnHv = TRUE;
+    RemoveEntryList(&vport->ovsNameLink);
+    RemoveEntryList(&vport->portIdLink);
+    RemoveEntryList(&vport->portNoLink);
+    if (hvSwitchPort) {
+        switchContext->numHvVports--;
+    } else {
+        switchContext->numNonHvVports--;
     }
-    if (vport->portNo == OVS_DPPORT_NUMBER_INVALID) {
-        deletedOnOvs = TRUE;
-    }
-
-    if (hvDelete && !deletedOnHv) {
-        vport->isPresentOnHv = TRUE;
-
-        /* Remove the port from the relevant lists. */
-        RemoveEntryList(&vport->portIdLink);
-        InitializeListHead(&vport->portIdLink);
-        deletedOnHv = TRUE;
-    }
-    if (ovsDelete && !deletedOnOvs) {
-        vport->portNo = OVS_DPPORT_NUMBER_INVALID;
-        vport->ovsName[0] = '\0';
-
-        /* Remove the port from the relevant lists. */
-        RemoveEntryList(&vport->ovsNameLink);
-        InitializeListHead(&vport->ovsNameLink);
-        RemoveEntryList(&vport->portNoLink);
-        InitializeListHead(&vport->portNoLink);
-        deletedOnOvs = TRUE;
-    }
-
-    /*
-     * Deallocate the port if it has been deleted on the Hyper-V switch as well
-     * as OVS userspace.
-     */
-    if (deletedOnHv && deletedOnOvs) {
-        if (hvSwitchPort) {
-            switchContext->numHvVports--;
-        } else {
-            switchContext->numNonHvVports--;
-        }
-        OvsFreeMemory(vport);
-        if (vportDeallocated) {
-            *vportDeallocated = TRUE;
-        }
-    }
+    OvsFreeMemory(vport);
 }
+
 
 NDIS_STATUS
 OvsAddConfiguredSwitchPorts(POVS_SWITCH_CONTEXT switchContext)
@@ -1187,7 +1418,7 @@ OvsAddConfiguredSwitchPorts(POVS_SWITCH_CONTEXT switchContext)
              goto cleanup;
          }
          OvsInitVportWithPortParam(vport, portParam);
-         status = InitHvVportCommon(switchContext, vport, TRUE);
+         status = InitHvVportCommon(switchContext, vport);
          if (status != NDIS_STATUS_SUCCESS) {
              OvsFreeMemory(vport);
              goto cleanup;
@@ -1246,7 +1477,7 @@ OvsInitConfiguredSwitchNics(POVS_SWITCH_CONTEXT switchContext)
             if (vport) {
                 OvsInitPhysNicVport(vport, virtExtVport,
                                     nicParam->NicIndex);
-                status = InitHvVportCommon(switchContext, vport, TRUE);
+                status = InitHvVportCommon(switchContext, vport);
                 if (status != NDIS_STATUS_SUCCESS) {
                     OvsFreeMemory(vport);
                     vport = NULL;
@@ -1293,7 +1524,7 @@ OvsClearAllSwitchVports(POVS_SWITCH_CONTEXT switchContext)
         LIST_FORALL_SAFE(head, link, next) {
             POVS_VPORT_ENTRY vport;
             vport = CONTAINING_RECORD(link, OVS_VPORT_ENTRY, portIdLink);
-            OvsRemoveAndDeleteVport(switchContext, vport, TRUE, TRUE, NULL);
+            OvsRemoveAndDeleteVport(switchContext, vport);
         }
     }
     /*
@@ -1302,8 +1533,7 @@ OvsClearAllSwitchVports(POVS_SWITCH_CONTEXT switchContext)
      */
     if (switchContext->virtualExternalVport) {
         OvsRemoveAndDeleteVport(switchContext,
-            (POVS_VPORT_ENTRY)switchContext->virtualExternalVport, TRUE, TRUE,
-            NULL);
+            (POVS_VPORT_ENTRY)switchContext->virtualExternalVport);
     }
 
     for (UINT hash = 0; hash < OVS_MAX_VPORT_ARRAY_SIZE; hash++) {
@@ -1315,8 +1545,8 @@ OvsClearAllSwitchVports(POVS_SWITCH_CONTEXT switchContext)
             vport = CONTAINING_RECORD(link, OVS_VPORT_ENTRY, portNoLink);
             ASSERT(OvsIsTunnelVportType(vport->ovsType) ||
                    (vport->ovsType == OVS_VPORT_TYPE_INTERNAL &&
-                    vport->isBridgeInternal) || vport->isPresentOnHv == TRUE);
-            OvsRemoveAndDeleteVport(switchContext, vport, TRUE, TRUE, NULL);
+                    vport->isBridgeInternal));
+            OvsRemoveAndDeleteVport(switchContext, vport);
         }
     }
 
@@ -1360,14 +1590,7 @@ OvsConvertIfCountedStrToAnsiStr(PIF_COUNTED_STRING wStr,
     return STATUS_SUCCESS;
 }
 
-/*
- * --------------------------------------------------------------------------
- * Utility function that populates a 'OVS_VPORT_EXT_INFO' structure for the
- * specified vport.
- *
- * Assumes that 'gOvsCtrlLock' is held.
- * --------------------------------------------------------------------------
- */
+
 NTSTATUS
 OvsGetExtInfoIoctl(POVS_VPORT_GET vportGet,
                    POVS_VPORT_EXT_INFO extInfo)
@@ -1379,17 +1602,11 @@ OvsGetExtInfoIoctl(POVS_VPORT_GET vportGet,
     BOOLEAN doConvert = FALSE;
 
     RtlZeroMemory(extInfo, sizeof (POVS_VPORT_EXT_INFO));
-    ASSERT(KeGetCurrentIrql() == DISPATCH_LEVEL);
     NdisAcquireRWLockRead(gOvsSwitchContext->dispatchLock, &lockState,
                           NDIS_RWL_AT_DISPATCH_LEVEL);
     if (vportGet->portNo == 0) {
         StringCbLengthA(vportGet->name, OVS_MAX_PORT_NAME_LENGTH - 1, &len);
-        vport = OvsFindVportByHvNameA(gOvsSwitchContext, vportGet->name);
-        if (vport != NULL) {
-            /* If the port is not a Hyper-V port and it has been added earlier,
-             * we'll find it in 'ovsPortNameHashArray'. */
-            vport = OvsFindVportByOvsName(gOvsSwitchContext, vportGet->name);
-        }
+        vport = OvsFindVportByHvName(gOvsSwitchContext, vportGet->name);
     } else {
         vport = OvsFindVportByPortNo(gOvsSwitchContext, vportGet->portNo);
     }
@@ -1438,6 +1655,7 @@ OvsGetExtInfoIoctl(POVS_VPORT_GET vportGet,
     }
     NdisReleaseRWLock(gOvsSwitchContext->dispatchLock, &lockState);
     if (doConvert) {
+		NdisReleaseSpinLock(gOvsCtrlLock);
         status = OvsConvertIfCountedStrToAnsiStr(&vport->portFriendlyName,
                                                  extInfo->name,
                                                  OVS_MAX_PORT_NAME_LENGTH);
@@ -1465,6 +1683,7 @@ OvsGetExtInfoIoctl(POVS_VPORT_GET vportGet,
          * for now ignore status
          */
         status = STATUS_SUCCESS;
+		NdisAcquireSpinLock(gOvsCtrlLock);
     }
 
 ext_info_done:
@@ -1535,7 +1754,7 @@ cleanup:
         POVS_MESSAGE_ERROR msgError = (POVS_MESSAGE_ERROR)
             usrParamsCtx->outputBuffer;
 
-        NlBuildErrorMsg(msgIn, msgError, nlError);
+        BuildErrorMsg(msgIn, msgError, nlError);
         *replyLen = msgError->nlMsg.nlmsgLen;
     }
 
@@ -1558,45 +1777,46 @@ CreateNetlinkMesgForNetdev(POVS_VPORT_EXT_INFO info,
 {
     NL_BUFFER nlBuffer;
     BOOLEAN ok;
+    OVS_MESSAGE msgOut;
     PNL_MSG_HDR nlMsg;
     UINT32 netdevFlags = 0;
 
     NlBufInit(&nlBuffer, outBuffer, outBufLen);
 
-    ok = NlFillOvsMsg(&nlBuffer, msgIn->nlMsg.nlmsgType, NLM_F_MULTI,
-                      msgIn->nlMsg.nlmsgSeq, msgIn->nlMsg.nlmsgPid,
-                      msgIn->genlMsg.cmd, msgIn->genlMsg.version,
-                      dpIfIndex);
+    BuildReplyMsgFromMsgIn(msgIn, &msgOut, 0);
+    msgOut.ovsHdr.dp_ifindex = dpIfIndex;
+
+    ok = NlMsgPutHead(&nlBuffer, (PCHAR)&msgOut, sizeof msgOut);
     if (!ok) {
-        return STATUS_INVALID_BUFFER_SIZE;
+        return STATUS_INSUFFICIENT_RESOURCES;
     }
 
     ok = NlMsgPutTailU32(&nlBuffer, OVS_WIN_NETDEV_ATTR_PORT_NO,
                          info->portNo);
     if (!ok) {
-        return STATUS_INVALID_BUFFER_SIZE;
+        return STATUS_INSUFFICIENT_RESOURCES;
     }
 
     ok = NlMsgPutTailU32(&nlBuffer, OVS_WIN_NETDEV_ATTR_TYPE, info->type);
     if (!ok) {
-        return STATUS_INVALID_BUFFER_SIZE;
+        return STATUS_INSUFFICIENT_RESOURCES;
     }
 
     ok = NlMsgPutTailString(&nlBuffer, OVS_WIN_NETDEV_ATTR_NAME,
                             info->name);
     if (!ok) {
-        return STATUS_INVALID_BUFFER_SIZE;
+        return STATUS_INSUFFICIENT_RESOURCES;
     }
 
     ok = NlMsgPutTailUnspec(&nlBuffer, OVS_WIN_NETDEV_ATTR_MAC_ADDR,
              (PCHAR)info->macAddress, sizeof (info->macAddress));
     if (!ok) {
-        return STATUS_INVALID_BUFFER_SIZE;
+        return STATUS_INSUFFICIENT_RESOURCES;
     }
 
     ok = NlMsgPutTailU32(&nlBuffer, OVS_WIN_NETDEV_ATTR_MTU, info->mtu);
     if (!ok) {
-        return STATUS_INVALID_BUFFER_SIZE;
+        return STATUS_INSUFFICIENT_RESOURCES;
     }
 
     if (info->status != OVS_EVENT_CONNECT) {
@@ -1605,7 +1825,7 @@ CreateNetlinkMesgForNetdev(POVS_VPORT_EXT_INFO info,
     ok = NlMsgPutTailU32(&nlBuffer, OVS_WIN_NETDEV_ATTR_IF_FLAGS,
                          netdevFlags);
     if (!ok) {
-        return STATUS_INVALID_BUFFER_SIZE;
+        return STATUS_INSUFFICIENT_RESOURCES;
     }
 
     /*
@@ -1630,707 +1850,407 @@ OvsWaitActivate(POVS_SWITCH_CONTEXT switchContext, ULONG sleepMicroSec)
     }
 }
 
-static NTSTATUS
-OvsCreateMsgFromVport(POVS_VPORT_ENTRY vport,
-                      POVS_MESSAGE msgIn,
-                      PVOID outBuffer,
-                      UINT32 outBufLen,
-                      int dpIfIndex)
-{
-    NL_BUFFER nlBuffer;
-    OVS_VPORT_FULL_STATS vportStats;
-    BOOLEAN ok;
-    PNL_MSG_HDR nlMsg;
-
-    NlBufInit(&nlBuffer, outBuffer, outBufLen);
-
-    ok = NlFillOvsMsg(&nlBuffer, msgIn->nlMsg.nlmsgType, NLM_F_MULTI,
-                      msgIn->nlMsg.nlmsgSeq, msgIn->nlMsg.nlmsgPid,
-                      msgIn->genlMsg.cmd, msgIn->genlMsg.version,
-                      dpIfIndex);
-    if (!ok) {
-        return STATUS_INVALID_BUFFER_SIZE;
-    }
-
-    ok = NlMsgPutTailU32(&nlBuffer, OVS_VPORT_ATTR_PORT_NO, vport->portNo);
-    if (!ok) {
-        return STATUS_INVALID_BUFFER_SIZE;
-    }
-
-    ok = NlMsgPutTailU32(&nlBuffer, OVS_VPORT_ATTR_TYPE, vport->ovsType);
-    if (!ok) {
-        return STATUS_INVALID_BUFFER_SIZE;
-    }
-
-    ok = NlMsgPutTailString(&nlBuffer, OVS_VPORT_ATTR_NAME, vport->ovsName);
-    if (!ok) {
-        return STATUS_INVALID_BUFFER_SIZE;
-    }
-
-    /*
-     * XXX: when we implement OVS_DP_ATTR_USER_FEATURES in datapath,
-     * we'll need to check the OVS_DP_F_VPORT_PIDS flag: if it is set,
-     * it means we have an array of pids, instead of a single pid.
-     * ATM we assume we have one pid only.
-    */
-
-    ok = NlMsgPutTailU32(&nlBuffer, OVS_VPORT_ATTR_UPCALL_PID,
-                         vport->upcallPid);
-    if (!ok) {
-        return STATUS_INVALID_BUFFER_SIZE;
-    }
-
-    /*stats*/
-    vportStats.rxPackets = vport->stats.rxPackets;
-    vportStats.rxBytes = vport->stats.rxBytes;
-    vportStats.txPackets = vport->stats.txPackets;
-    vportStats.txBytes = vport->stats.txBytes;
-    vportStats.rxErrors = vport->errStats.rxErrors;
-    vportStats.txErrors = vport->errStats.txErrors;
-    vportStats.rxDropped = vport->errStats.rxDropped;
-    vportStats.txDropped = vport->errStats.txDropped;
-
-    ok = NlMsgPutTailUnspec(&nlBuffer, OVS_VPORT_ATTR_STATS,
-                            (PCHAR)&vportStats,
-                            sizeof(OVS_VPORT_FULL_STATS));
-    if (!ok) {
-        return STATUS_INVALID_BUFFER_SIZE;
-    }
-
-    /*
-     * XXX: when vxlan udp dest port becomes configurable, we will also need
-     * to add vport options
-    */
-
-    nlMsg = (PNL_MSG_HDR)NlBufAt(&nlBuffer, 0, 0);
-    nlMsg->nlmsgLen = NlBufSize(&nlBuffer);
-
-    return STATUS_SUCCESS;
-}
-
-static NTSTATUS
-OvsGetVportDumpNext(POVS_USER_PARAMS_CONTEXT usrParamsCtx,
-                    UINT32 *replyLen)
-{
-    POVS_MESSAGE msgIn;
-    POVS_OPEN_INSTANCE instance =
-        (POVS_OPEN_INSTANCE)usrParamsCtx->ovsInstance;
-    LOCK_STATE_EX lockState;
-    UINT32 i = OVS_MAX_VPORT_ARRAY_SIZE;
-
-    /*
-     * XXX: this function shares some code with other dump command(s).
-     * In the future, we will need to refactor the dump functions
-    */
-
-    ASSERT(usrParamsCtx->devOp == OVS_READ_DEV_OP);
-
-    if (instance->dumpState.ovsMsg == NULL) {
-        ASSERT(FALSE);
-        return STATUS_INVALID_DEVICE_STATE;
-    }
-
-    /* Output buffer has been validated while validating read dev op. */
-    ASSERT(usrParamsCtx->outputBuffer != NULL);
-
-    msgIn = instance->dumpState.ovsMsg;
-
-    OvsAcquireCtrlLock();
-
-    /*
-     * XXX: when we implement OVS_DP_ATTR_USER_FEATURES in datapath,
-     * we'll need to check the OVS_DP_F_VPORT_PIDS flag: if it is set,
-     * it means we have an array of pids, instead of a single pid.
-     * ATM we assume we have one pid only.
-    */
-    ASSERT(KeGetCurrentIrql() == DISPATCH_LEVEL);
-    NdisAcquireRWLockRead(gOvsSwitchContext->dispatchLock, &lockState,
-                          NDIS_RWL_AT_DISPATCH_LEVEL);
-
-    if (gOvsSwitchContext->numHvVports > 0 ||
-            gOvsSwitchContext->numNonHvVports > 0) {
-        /* inBucket: the bucket, used for lookup */
-        UINT32 inBucket = instance->dumpState.index[0];
-        /* inIndex: index within the given bucket, used for lookup */
-        UINT32 inIndex = instance->dumpState.index[1];
-        /* the bucket to be used for the next dump operation */
-        UINT32 outBucket = 0;
-        /* the index within the outBucket to be used for the next dump */
-        UINT32 outIndex = 0;
-
-        for (i = inBucket; i < OVS_MAX_VPORT_ARRAY_SIZE; i++) {
-            PLIST_ENTRY head, link;
-            head = &(gOvsSwitchContext->portNoHashArray[i]);
-            POVS_VPORT_ENTRY vport = NULL;
-
-            outIndex = 0;
-            LIST_FORALL(head, link) {
-
-                /*
-                 * if one or more dumps were previously done on this same bucket,
-                 * inIndex will be > 0, so we'll need to reply with the
-                 * inIndex + 1 vport from the bucket.
-                */
-                if (outIndex >= inIndex) {
-                    vport = CONTAINING_RECORD(link, OVS_VPORT_ENTRY, portNoLink);
-
-                    ASSERT(vport->portNo != OVS_DPPORT_NUMBER_INVALID);
-                    OvsCreateMsgFromVport(vport, msgIn,
-                                          usrParamsCtx->outputBuffer,
-                                          usrParamsCtx->outputLength,
-                                          gOvsSwitchContext->dpNo);
-                    ++outIndex;
-                    break;
-                }
-
-                ++outIndex;
-            }
-
-            if (vport) {
-                break;
-            }
-
-            /*
-             * if no vport was found above, check the next bucket, beginning
-             * with the first (i.e. index 0) elem from within that bucket
-            */
-            inIndex = 0;
-        }
-
-        outBucket = i;
-
-        /* XXX: what about NLMSG_DONE (as msg type)? */
-        instance->dumpState.index[0] = outBucket;
-        instance->dumpState.index[1] = outIndex;
-    }
-
-    NdisReleaseRWLock(gOvsSwitchContext->dispatchLock, &lockState);
-
-    OvsReleaseCtrlLock();
-
-    /* if i < OVS_MAX_VPORT_ARRAY_SIZE => vport was found */
-    if (i < OVS_MAX_VPORT_ARRAY_SIZE) {
-        POVS_MESSAGE msgOut = (POVS_MESSAGE)usrParamsCtx->outputBuffer;
-        *replyLen = msgOut->nlMsg.nlmsgLen;
-    } else {
-        /*
-         * if i >= OVS_MAX_VPORT_ARRAY_SIZE => vport was not found =>
-         * it's dump done
-         */
-        *replyLen = 0;
-        /* Free up the dump state, since there's no more data to continue. */
-        FreeUserDumpState(instance);
-    }
-
-    return STATUS_SUCCESS;
-}
-
-static NTSTATUS
-OvsGetVport(POVS_USER_PARAMS_CONTEXT usrParamsCtx,
-            UINT32 *replyLen)
-{
-    NTSTATUS status = STATUS_SUCCESS;
-    LOCK_STATE_EX lockState;
-
-    POVS_MESSAGE msgIn = (POVS_MESSAGE)usrParamsCtx->inputBuffer;
-    POVS_MESSAGE msgOut = (POVS_MESSAGE)usrParamsCtx->outputBuffer;
-    POVS_VPORT_ENTRY vport = NULL;
-    NL_ERROR nlError = NL_ERROR_SUCCESS;
-    PCHAR portName = NULL;
-    UINT32 portNameLen = 0;
-    UINT32 portNumber = OVS_DPPORT_NUMBER_INVALID;
-
-    static const NL_POLICY ovsVportPolicy[] = {
-        [OVS_VPORT_ATTR_PORT_NO] = { .type = NL_A_U32, .optional = TRUE },
-        [OVS_VPORT_ATTR_NAME] = { .type = NL_A_STRING,
-                                  .minLen = 2,
-                                  .maxLen = IFNAMSIZ,
-                                  .optional = TRUE},
-    };
-    PNL_ATTR vportAttrs[ARRAY_SIZE(ovsVportPolicy)];
-
-    /* input buffer has been validated while validating write dev op. */
-    ASSERT(usrParamsCtx->inputBuffer != NULL);
-
-    if (!NlAttrParse((PNL_MSG_HDR)msgIn,
-        NLMSG_HDRLEN + GENL_HDRLEN + OVS_HDRLEN,
-        NlMsgAttrsLen((PNL_MSG_HDR)msgIn),
-        ovsVportPolicy, vportAttrs, ARRAY_SIZE(vportAttrs))) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    /* Output buffer has been validated while validating transact dev op. */
-    ASSERT(msgOut != NULL && usrParamsCtx->outputLength >= sizeof *msgOut);
-
-    NdisAcquireRWLockRead(gOvsSwitchContext->dispatchLock, &lockState, 0);
-    if (vportAttrs[OVS_VPORT_ATTR_NAME] != NULL) {
-        portName = NlAttrGet(vportAttrs[OVS_VPORT_ATTR_NAME]);
-        portNameLen = NlAttrGetSize(vportAttrs[OVS_VPORT_ATTR_NAME]);
-
-        /* the port name is expected to be null-terminated */
-        ASSERT(portName[portNameLen - 1] == '\0');
-
-        vport = OvsFindVportByOvsName(gOvsSwitchContext, portName);
-    } else if (vportAttrs[OVS_VPORT_ATTR_PORT_NO] != NULL) {
-        portNumber = NlAttrGetU32(vportAttrs[OVS_VPORT_ATTR_PORT_NO]);
-
-        vport = OvsFindVportByPortNo(gOvsSwitchContext, portNumber);
-    } else {
-        nlError = NL_ERROR_INVAL;
-        NdisReleaseRWLock(gOvsSwitchContext->dispatchLock, &lockState);
-        goto Cleanup;
-    }
-
-    if (!vport) {
-        nlError = NL_ERROR_NODEV;
-        NdisReleaseRWLock(gOvsSwitchContext->dispatchLock, &lockState);
-        goto Cleanup;
-    }
-
-    status = OvsCreateMsgFromVport(vport, msgIn, usrParamsCtx->outputBuffer,
-                                   usrParamsCtx->outputLength,
-                                   gOvsSwitchContext->dpNo);
-    NdisReleaseRWLock(gOvsSwitchContext->dispatchLock, &lockState);
-
-    *replyLen = msgOut->nlMsg.nlmsgLen;
-
-Cleanup:
-    if (nlError != NL_ERROR_SUCCESS) {
-        POVS_MESSAGE_ERROR msgError = (POVS_MESSAGE_ERROR)
-            usrParamsCtx->outputBuffer;
-
-        NlBuildErrorMsg(msgIn, msgError, nlError);
-        *replyLen = msgError->nlMsg.nlmsgLen;
-    }
-
-    return STATUS_SUCCESS;
-}
 
 /*
- * --------------------------------------------------------------------------
- *  Command Handler for 'OVS_VPORT_CMD_NEW'.
- *
- *  The function handles the initial call to setup the dump state, as well as
- *  subsequent calls to continue dumping data.
- * --------------------------------------------------------------------------
+* --------------------------------------------------------------------------
+*  Command Handler for 'OVS_VPORT_CMD_SET'.
+* --------------------------------------------------------------------------
 */
 NTSTATUS
-OvsGetVportCmdHandler(POVS_USER_PARAMS_CONTEXT usrParamsCtx,
-                      UINT32 *replyLen)
+OvsSetVportCmdHandler(POVS_USER_PARAMS_CONTEXT usrParamsCtx,
+UINT32 *replyLen)
 {
-    *replyLen = 0;
+	NDIS_STATUS status = STATUS_SUCCESS;
+	LOCK_STATE_EX lockState;
 
-    switch (usrParamsCtx->devOp) {
-    case OVS_WRITE_DEV_OP:
-        return OvsSetupDumpStart(usrParamsCtx);
+	POVS_MESSAGE msgIn = (POVS_MESSAGE)usrParamsCtx->inputBuffer;
+	POVS_MESSAGE msgOut = (POVS_MESSAGE)usrParamsCtx->outputBuffer;
+	POVS_VPORT_ENTRY vport = NULL;
+	NL_ERROR nlError = NL_ERROR_SUCCESS;
 
-    case OVS_READ_DEV_OP:
-        return OvsGetVportDumpNext(usrParamsCtx, replyLen);
+	static const NL_POLICY ovsVportPolicy[] = {
+		[OVS_VPORT_ATTR_PORT_NO] = { .type = NL_A_U32, .optional = TRUE },
+		[OVS_VPORT_ATTR_TYPE] = { .type = NL_A_U32, .optional = TRUE },
+		[OVS_VPORT_ATTR_NAME] = { .type = NL_A_STRING, .maxLen = IFNAMSIZ,
+		.optional = TRUE },
+		[OVS_VPORT_ATTR_UPCALL_PID] = { .type = NL_A_UNSPEC,
+		.optional = TRUE },
+		[OVS_VPORT_ATTR_STATS] = { .type = NL_A_UNSPEC,
+		.minLen = sizeof(OVS_VPORT_FULL_STATS),
+		.maxLen = sizeof(OVS_VPORT_FULL_STATS),
+		.optional = TRUE },
+		[OVS_VPORT_ATTR_OPTIONS] = { .type = NL_A_NESTED, .optional = TRUE },
+	};
+	PNL_ATTR vportAttrs[ARRAY_SIZE(ovsVportPolicy)];
 
-    case OVS_TRANSACTION_DEV_OP:
-        return OvsGetVport(usrParamsCtx, replyLen);
+	ASSERT(usrParamsCtx->inputBuffer != NULL);
 
-    default:
-        return STATUS_INVALID_DEVICE_REQUEST;
-    }
+	if (!NlAttrParse((PNL_MSG_HDR)msgIn,
+		NLMSG_HDRLEN + GENL_HDRLEN + OVS_HDRLEN,
+		NlMsgAttrsLen((PNL_MSG_HDR)msgIn),
+		ovsVportPolicy, vportAttrs, ARRAY_SIZE(vportAttrs))) {
+		return STATUS_INVALID_PARAMETER;
+	}
 
+	if (msgOut == NULL || usrParamsCtx->outputLength < sizeof *msgOut) {
+		return STATUS_NDIS_INVALID_LENGTH;
+	}
+
+	OvsAcquireCtrlLock();
+
+	NdisAcquireRWLockWrite(gOvsSwitchContext->dispatchLock, &lockState, 0);
+	if (vportAttrs[OVS_VPORT_ATTR_NAME] != NULL) {
+		PSTR portName = NlAttrGet(vportAttrs[OVS_VPORT_ATTR_NAME]);
+#ifdef DBG
+		UINT32 portNameLen = NlAttrGetSize(vportAttrs[OVS_VPORT_ATTR_NAME]);
+#endif
+		/* the port name is expected to be null-terminated */
+		ASSERT(portName[portNameLen - 1] == '\0');
+
+		vport = OvsFindVportByOvsName(gOvsSwitchContext, portName);
+	}
+	else if (vportAttrs[OVS_VPORT_ATTR_PORT_NO] != NULL) {
+		vport = OvsFindVportByPortNo(gOvsSwitchContext,
+			NlAttrGetU32(vportAttrs[OVS_VPORT_ATTR_PORT_NO]));
+	}
+
+	if (!vport) {
+		nlError = NL_ERROR_NODEV;
+		goto Cleanup;
+	}
+
+	/*
+	* XXX: when we implement OVS_DP_ATTR_USER_FEATURES in datapath,
+	* we'll need to check the OVS_DP_F_VPORT_PIDS flag: if it is set,
+	* it means we have an array of pids, instead of a single pid.
+	* Currently, we support only one pid.
+	*/
+	if (vportAttrs[OVS_VPORT_ATTR_UPCALL_PID]) {
+		vport->upcallPid = NlAttrGetU32(vportAttrs[OVS_VPORT_ATTR_UPCALL_PID]);
+	}
+
+	if (vportAttrs[OVS_VPORT_ATTR_TYPE]) {
+		OVS_VPORT_TYPE type = NlAttrGetU32(vportAttrs[OVS_VPORT_ATTR_TYPE]);
+		if (type != vport->ovsType) {
+			nlError = NL_ERROR_INVAL;
+			goto Cleanup;
+		}
+	}
+
+	if (vportAttrs[OVS_VPORT_ATTR_OPTIONS]) {
+		OVS_LOG_ERROR("Vport options not supported");
+		nlError = NL_ERROR_NOTSUPP;
+		goto Cleanup;
+	}
+
+	status = OvsCreateMsgFromVport(vport, msgIn, usrParamsCtx->outputBuffer,
+		usrParamsCtx->outputLength,
+		gOvsSwitchContext->dpNo);
+
+	*replyLen = msgOut->nlMsg.nlmsgLen;
+
+Cleanup:
+	NdisReleaseRWLock(gOvsSwitchContext->dispatchLock, &lockState);
+	OvsReleaseCtrlLock();
+
+	if (nlError != NL_ERROR_SUCCESS) {
+		POVS_MESSAGE_ERROR msgError = (POVS_MESSAGE_ERROR)
+			usrParamsCtx->outputBuffer;
+
+		BuildErrorMsg(msgIn, msgError, nlError);
+		*replyLen = msgError->nlMsg.nlmsgLen;
+	}
+
+	return STATUS_SUCCESS;
 }
 
-static UINT32
-OvsComputeVportNo(POVS_SWITCH_CONTEXT switchContext)
-{
-    /* we are not allowed to create the port OVS_DPPORT_NUMBER_LOCAL */
-    for (ULONG i = OVS_DPPORT_NUMBER_LOCAL + 1; i < MAXUINT16; ++i) {
-        POVS_VPORT_ENTRY vport;
-
-        vport = OvsFindVportByPortNo(switchContext, i);
-        if (!vport) {
-            return i;
-        }
-    }
-
-    return OVS_DPPORT_NUMBER_INVALID;
-}
 
 /*
- * --------------------------------------------------------------------------
- *  Command Handler for 'OVS_VPORT_CMD_NEW'.
- * --------------------------------------------------------------------------
- */
+* --------------------------------------------------------------------------
+*  Command Handler for 'OVS_VPORT_CMD_NEW'.
+* --------------------------------------------------------------------------
+*/
 NTSTATUS
 OvsNewVportCmdHandler(POVS_USER_PARAMS_CONTEXT usrParamsCtx,
-                      UINT32 *replyLen)
+UINT32 *replyLen)
 {
-    NDIS_STATUS status = STATUS_SUCCESS;
-    LOCK_STATE_EX lockState;
+	NDIS_STATUS status = STATUS_SUCCESS;
+	LOCK_STATE_EX lockState;
 
-    NL_ERROR nlError = NL_ERROR_SUCCESS;
-    POVS_MESSAGE msgIn = (POVS_MESSAGE)usrParamsCtx->inputBuffer;
-    POVS_MESSAGE msgOut = (POVS_MESSAGE)usrParamsCtx->outputBuffer;
-    POVS_VPORT_ENTRY vport = NULL;
-    PCHAR portName;
-    ULONG portNameLen;
-    UINT32 portType;
-    BOOLEAN isBridgeInternal = FALSE;
-    BOOLEAN vportAllocated = FALSE, vportInitialized = FALSE;
-    BOOLEAN addInternalPortAsNetdev = FALSE;
+	NL_ERROR nlError = NL_ERROR_SUCCESS;
+	POVS_MESSAGE msgIn = (POVS_MESSAGE)usrParamsCtx->inputBuffer;
+	POVS_MESSAGE msgOut = (POVS_MESSAGE)usrParamsCtx->outputBuffer;
+	POVS_VPORT_ENTRY vport = NULL;
+	PCHAR portName;
+	ULONG portNameLen;
+	UINT32 portType;
+	BOOLEAN isBridgeInternal = FALSE;
+	BOOLEAN vportAllocated = FALSE;
+	BOOLEAN addInternalPortAsNetdev = FALSE;
 
-    static const NL_POLICY ovsVportPolicy[] = {
-        [OVS_VPORT_ATTR_PORT_NO] = { .type = NL_A_U32, .optional = TRUE },
-        [OVS_VPORT_ATTR_TYPE] = { .type = NL_A_U32, .optional = FALSE },
-        [OVS_VPORT_ATTR_NAME] = { .type = NL_A_STRING, .maxLen = IFNAMSIZ,
-                                  .optional = FALSE},
-        [OVS_VPORT_ATTR_UPCALL_PID] = { .type = NL_A_UNSPEC,
-                                        .optional = FALSE },
-        [OVS_VPORT_ATTR_OPTIONS] = { .type = NL_A_NESTED, .optional = TRUE },
-    };
+	static const NL_POLICY ovsVportPolicy[] = {
+		[OVS_VPORT_ATTR_PORT_NO] = { .type = NL_A_U32, .optional = TRUE },
+		[OVS_VPORT_ATTR_TYPE] = { .type = NL_A_U32, .optional = FALSE },
+		[OVS_VPORT_ATTR_NAME] = { .type = NL_A_STRING, .maxLen = IFNAMSIZ,
+		.optional = FALSE },
+		[OVS_VPORT_ATTR_UPCALL_PID] = { .type = NL_A_UNSPEC,
+		.optional = FALSE },
+		[OVS_VPORT_ATTR_OPTIONS] = { .type = NL_A_NESTED, .optional = TRUE },
+	};
 
-    PNL_ATTR vportAttrs[ARRAY_SIZE(ovsVportPolicy)];
+	PNL_ATTR vportAttrs[ARRAY_SIZE(ovsVportPolicy)];
 
-    /* input buffer has been validated while validating write dev op. */
-    ASSERT(usrParamsCtx->inputBuffer != NULL);
+	/* input buffer has been validated while validating write dev op. */
+	ASSERT(usrParamsCtx->inputBuffer != NULL);
 
-    /* Output buffer has been validated while validating transact dev op. */
-    ASSERT(msgOut != NULL && usrParamsCtx->outputLength >= sizeof *msgOut);
+	if (msgOut == NULL || usrParamsCtx->outputLength < sizeof *msgOut) {
+		return STATUS_INVALID_BUFFER_SIZE;
+	}
 
-    if (!NlAttrParse((PNL_MSG_HDR)msgIn,
-        NLMSG_HDRLEN + GENL_HDRLEN + OVS_HDRLEN,
-        NlMsgAttrsLen((PNL_MSG_HDR)msgIn),
-        ovsVportPolicy, vportAttrs, ARRAY_SIZE(vportAttrs))) {
-        return STATUS_INVALID_PARAMETER;
-    }
+	if (!NlAttrParse((PNL_MSG_HDR)msgIn,
+		NLMSG_HDRLEN + GENL_HDRLEN + OVS_HDRLEN,
+		NlMsgAttrsLen((PNL_MSG_HDR)msgIn),
+		ovsVportPolicy, vportAttrs, ARRAY_SIZE(vportAttrs))) {
+		return STATUS_INVALID_PARAMETER;
+	}
 
-    portName = NlAttrGet(vportAttrs[OVS_VPORT_ATTR_NAME]);
-    portNameLen = NlAttrGetSize(vportAttrs[OVS_VPORT_ATTR_NAME]);
-    portType = NlAttrGetU32(vportAttrs[OVS_VPORT_ATTR_TYPE]);
+	portName = NlAttrGet(vportAttrs[OVS_VPORT_ATTR_NAME]);
+	portNameLen = NlAttrGetSize(vportAttrs[OVS_VPORT_ATTR_NAME]);
+	portType = NlAttrGetU32(vportAttrs[OVS_VPORT_ATTR_TYPE]);
 
-    /* we are expecting null terminated strings to be passed */
-    ASSERT(portName[portNameLen - 1] == '\0');
+	/* we are expecting null terminated strings to be passed */
+	ASSERT(portName[portNameLen - 1] == '\0');
 
-    NdisAcquireRWLockWrite(gOvsSwitchContext->dispatchLock, &lockState, 0);
+	NdisAcquireRWLockWrite(gOvsSwitchContext->dispatchLock, &lockState, 0);
 
-    vport = OvsFindVportByOvsName(gOvsSwitchContext, portName);
-    if (vport) {
-        nlError = NL_ERROR_EXIST;
-        goto Cleanup;
-    }
+	vport = OvsFindVportByOvsName(gOvsSwitchContext, portName);
+	if (vport) {
+		nlError = NL_ERROR_EXIST;
+		goto Cleanup;
+	}
 
-    if (portName && portType == OVS_VPORT_TYPE_NETDEV &&
-        !strcmp(OVS_DPPORT_INTERNAL_NAME_A, portName)) {
-        addInternalPortAsNetdev = TRUE;
-    }
+	if (portName && portType == OVS_VPORT_TYPE_NETDEV &&
+		!strcmp(OVS_DPPORT_INTERNAL_NAME_A, portName)) {
+		addInternalPortAsNetdev = TRUE;
+	}
 
-    if (portName && portType == OVS_VPORT_TYPE_INTERNAL &&
-        strcmp(OVS_DPPORT_INTERNAL_NAME_A, portName)) {
-        isBridgeInternal = TRUE;
-    }
+	if (portName && portType == OVS_VPORT_TYPE_INTERNAL &&
+		strcmp(OVS_DPPORT_INTERNAL_NAME_A, portName)) {
+		isBridgeInternal = TRUE;
+	}
 
-    if (portType == OVS_VPORT_TYPE_INTERNAL && !isBridgeInternal) {
-        vport = gOvsSwitchContext->internalVport;
-    } else if (portType == OVS_VPORT_TYPE_NETDEV) {
-        /* External ports can also be looked up like VIF ports. */
-        vport = OvsFindVportByHvNameA(gOvsSwitchContext, portName);
-    } else {
-        ASSERT(OvsIsTunnelVportType(portType) ||
-               (portType == OVS_VPORT_TYPE_INTERNAL && isBridgeInternal));
-        ASSERT(OvsGetTunnelVport(gOvsSwitchContext, portType) == NULL ||
-               !OvsIsTunnelVportType(portType));
+	if (portType == OVS_VPORT_TYPE_INTERNAL && !isBridgeInternal) {
+		vport = gOvsSwitchContext->internalVport;
+	}
+	else if (portType == OVS_VPORT_TYPE_NETDEV) {
+		/* External ports can also be looked up like VIF ports. */
+		vport = OvsFindVportByHvName(gOvsSwitchContext, portName);
+	}
+	else {
+		ASSERT(OvsIsTunnelVportType(portType) ||
+			(portType == OVS_VPORT_TYPE_INTERNAL && isBridgeInternal));
+		ASSERT(OvsGetTunnelVport(gOvsSwitchContext, portType) == NULL ||
+			!OvsIsTunnelVportType(portType));
 
-        vport = (POVS_VPORT_ENTRY)OvsAllocateVport();
-        if (vport == NULL) {
-            nlError = NL_ERROR_NOMEM;
-            goto Cleanup;
-        }
-        vportAllocated = TRUE;
+		vport = (POVS_VPORT_ENTRY)OvsAllocateVport();
+		if (vport == NULL) {
+			nlError = NL_ERROR_NOMEM;
+			goto Cleanup;
+		}
+		vportAllocated = TRUE;
 
-        if (OvsIsTunnelVportType(portType)) {
-            status = OvsInitTunnelVport(vport, portType, VXLAN_UDP_PORT);
-            nlError = NlMapStatusToNlErr(status);
-        } else {
-            OvsInitBridgeInternalVport(vport);
-        }
-        vportInitialized = TRUE;
+		if (OvsIsTunnelVportType(portType)) {
+			nlError = OvsInitTunnelVport(vport, portType, VXLAN_UDP_PORT);
+		}
+		else {
+			OvsInitBridgeInternalVport(vport);
+		}
 
-        if (nlError == NL_ERROR_SUCCESS) {
-            vport->ovsState = OVS_STATE_CONNECTED;
-            vport->nicState = NdisSwitchNicStateConnected;
+		if (nlError == NL_ERROR_SUCCESS) {
+			vport->ovsState = OVS_STATE_CONNECTED;
+			vport->nicState = NdisSwitchNicStateConnected;
 
-            /*
-             * Allow the vport to be deleted, because there is no
-             * corresponding hyper-v switch part.
-             */
-            vport->isPresentOnHv = TRUE;
-        }
-    }
+			/*
+			* Allow the vport to be deleted, because there is no
+			* corresponding hyper-v switch part.
+			*/
+			vport->hvDeleted = TRUE;
+		}
+	}
 
-    if (!vport) {
-        nlError = NL_ERROR_INVAL;
-        goto Cleanup;
-    }
-    if (vport->portNo != OVS_DPPORT_NUMBER_INVALID) {
-        nlError = NL_ERROR_EXIST;
-        goto Cleanup;
-    }
+	if (!vport) {
+		nlError = NL_ERROR_INVAL;
+		goto Cleanup;
+	}
+	if (vport->portNo != OVS_DPPORT_NUMBER_INVALID) {
+		nlError = NL_ERROR_EXIST;
+		goto Cleanup;
+	}
 
-    /* Initialize the vport with OVS specific properties. */
-    if (addInternalPortAsNetdev != TRUE) {
-        vport->ovsType = portType;
-    }
-    if (vportAttrs[OVS_VPORT_ATTR_PORT_NO] != NULL) {
-        /*
-         * XXX: when we implement the limit for ovs port number to be
-         * MAXUINT16, we'll need to check the port number received from the
-         * userspace.
-         */
-        vport->portNo = NlAttrGetU32(vportAttrs[OVS_VPORT_ATTR_PORT_NO]);
-    } else {
-        vport->portNo = OvsComputeVportNo(gOvsSwitchContext);
-        if (vport->portNo == OVS_DPPORT_NUMBER_INVALID) {
-            nlError = NL_ERROR_NOMEM;
-            goto Cleanup;
-        }
-    }
+	/* Initialize the vport with OVS specific properties. */
+	if (addInternalPortAsNetdev != TRUE) {
+		vport->ovsType = portType;
+	}
+	if (vportAttrs[OVS_VPORT_ATTR_PORT_NO] != NULL) {
+		/*
+		* XXX: when we implement the limit for ovs port number to be
+		* MAXUINT16, we'll need to check the port number received from the
+		* userspace.
+		*/
+		vport->portNo = NlAttrGetU32(vportAttrs[OVS_VPORT_ATTR_PORT_NO]);
+	}
+	else {
+		vport->portNo = OvsComputeVportNo(gOvsSwitchContext);
+		if (vport->portNo == OVS_DPPORT_NUMBER_INVALID) {
+			nlError = NL_ERROR_NOMEM;
+			goto Cleanup;
+		}
+	}
 
-    /* The ovs port name must be uninitialized. */
-    ASSERT(vport->ovsName[0] == '\0');
-    ASSERT(portNameLen <= OVS_MAX_PORT_NAME_LENGTH);
+	/* The ovs port name must be uninitialized. */
+	ASSERT(vport->ovsName[0] == '\0');
+	ASSERT(portNameLen <= OVS_MAX_PORT_NAME_LENGTH);
 
-    RtlCopyMemory(vport->ovsName, portName, portNameLen);
-    /* if we don't have options, then vport->portOptions will be NULL */
-    vport->portOptions = vportAttrs[OVS_VPORT_ATTR_OPTIONS];
+	RtlCopyMemory(vport->ovsName, portName, portNameLen);
+	/* if we don't have options, then vport->portOptions will be NULL */
+	vport->portOptions = vportAttrs[OVS_VPORT_ATTR_OPTIONS];
 
-    /*
-     * XXX: when we implement OVS_DP_ATTR_USER_FEATURES in datapath,
-     * we'll need to check the OVS_DP_F_VPORT_PIDS flag: if it is set,
-     * it means we have an array of pids, instead of a single pid.
-     * ATM we assume we have one pid only.
-     */
-    vport->upcallPid = NlAttrGetU32(vportAttrs[OVS_VPORT_ATTR_UPCALL_PID]);
+	/*
+	* XXX: when we implement OVS_DP_ATTR_USER_FEATURES in datapath,
+	* we'll need to check the OVS_DP_F_VPORT_PIDS flag: if it is set,
+	* it means we have an array of pids, instead of a single pid.
+	* ATM we assume we have one pid only.
+	*/
+	vport->upcallPid = NlAttrGetU32(vportAttrs[OVS_VPORT_ATTR_UPCALL_PID]);
 
-    status = InitOvsVportCommon(gOvsSwitchContext, vport);
-    ASSERT(status == STATUS_SUCCESS);
+	status = InitOvsVportCommon(gOvsSwitchContext, vport);
+	ASSERT(status == STATUS_SUCCESS);
 
-    status = OvsCreateMsgFromVport(vport, msgIn, usrParamsCtx->outputBuffer,
-                                   usrParamsCtx->outputLength,
-                                   gOvsSwitchContext->dpNo);
+	status = OvsCreateMsgFromVport(vport, msgIn, usrParamsCtx->outputBuffer,
+		usrParamsCtx->outputLength,
+		gOvsSwitchContext->dpNo);
 
-    *replyLen = msgOut->nlMsg.nlmsgLen;
+	*replyLen = msgOut->nlMsg.nlmsgLen;
 
 Cleanup:
-    NdisReleaseRWLock(gOvsSwitchContext->dispatchLock, &lockState);
+	NdisReleaseRWLock(gOvsSwitchContext->dispatchLock, &lockState);
 
-    if (nlError != NL_ERROR_SUCCESS) {
-        POVS_MESSAGE_ERROR msgError = (POVS_MESSAGE_ERROR)
-            usrParamsCtx->outputBuffer;
+	if (nlError != NL_ERROR_SUCCESS) {
+		POVS_MESSAGE_ERROR msgError = (POVS_MESSAGE_ERROR)
+			usrParamsCtx->outputBuffer;
 
-        if (vport && vportAllocated == TRUE) {
-            if (vportInitialized == TRUE) {
-                if (OvsIsTunnelVportType(portType)) {
-                    OvsCleanupVxlanTunnel(vport);
-                }
-            }
-            OvsFreeMemory(vport);
-        }
+		if (vport && vportAllocated == TRUE) {
+			OvsRemoveAndDeleteVport(gOvsSwitchContext, vport);
+		}
 
-        NlBuildErrorMsg(msgIn, msgError, nlError);
-        *replyLen = msgError->nlMsg.nlmsgLen;
-    }
+		BuildErrorMsg(msgIn, msgError, nlError);
+		*replyLen = msgError->nlMsg.nlmsgLen;
+	}
 
-    return STATUS_SUCCESS;
+	return STATUS_SUCCESS;
 }
 
 
 /*
- * --------------------------------------------------------------------------
- *  Command Handler for 'OVS_VPORT_CMD_SET'.
- * --------------------------------------------------------------------------
- */
-NTSTATUS
-OvsSetVportCmdHandler(POVS_USER_PARAMS_CONTEXT usrParamsCtx,
-                      UINT32 *replyLen)
-{
-    NDIS_STATUS status = STATUS_SUCCESS;
-    LOCK_STATE_EX lockState;
-
-    POVS_MESSAGE msgIn = (POVS_MESSAGE)usrParamsCtx->inputBuffer;
-    POVS_MESSAGE msgOut = (POVS_MESSAGE)usrParamsCtx->outputBuffer;
-    POVS_VPORT_ENTRY vport = NULL;
-    NL_ERROR nlError = NL_ERROR_SUCCESS;
-
-    static const NL_POLICY ovsVportPolicy[] = {
-        [OVS_VPORT_ATTR_PORT_NO] = { .type = NL_A_U32, .optional = TRUE },
-        [OVS_VPORT_ATTR_TYPE] = { .type = NL_A_U32, .optional = TRUE },
-        [OVS_VPORT_ATTR_NAME] = { .type = NL_A_STRING, .maxLen = IFNAMSIZ,
-                                  .optional = TRUE },
-        [OVS_VPORT_ATTR_UPCALL_PID] = { .type = NL_A_UNSPEC,
-                                        .optional = TRUE },
-        [OVS_VPORT_ATTR_STATS] = { .type = NL_A_UNSPEC,
-                                   .minLen = sizeof(OVS_VPORT_FULL_STATS),
-                                   .maxLen = sizeof(OVS_VPORT_FULL_STATS),
-                                   .optional = TRUE },
-        [OVS_VPORT_ATTR_OPTIONS] = { .type = NL_A_NESTED, .optional = TRUE },
-    };
-    PNL_ATTR vportAttrs[ARRAY_SIZE(ovsVportPolicy)];
-
-    ASSERT(usrParamsCtx->inputBuffer != NULL);
-
-    if (!NlAttrParse((PNL_MSG_HDR)msgIn,
-        NLMSG_HDRLEN + GENL_HDRLEN + OVS_HDRLEN,
-        NlMsgAttrsLen((PNL_MSG_HDR)msgIn),
-        ovsVportPolicy, vportAttrs, ARRAY_SIZE(vportAttrs))) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    /* Output buffer has been validated while validating transact dev op. */
-    ASSERT(msgOut != NULL && usrParamsCtx->outputLength >= sizeof *msgOut);
-
-    OvsAcquireCtrlLock();
-
-    NdisAcquireRWLockWrite(gOvsSwitchContext->dispatchLock, &lockState, 0);
-    if (vportAttrs[OVS_VPORT_ATTR_NAME] != NULL) {
-        PSTR portName = NlAttrGet(vportAttrs[OVS_VPORT_ATTR_NAME]);
-#ifdef DBG
-        UINT32 portNameLen = NlAttrGetSize(vportAttrs[OVS_VPORT_ATTR_NAME]);
-#endif
-        /* the port name is expected to be null-terminated */
-        ASSERT(portName[portNameLen - 1] == '\0');
-
-        vport = OvsFindVportByOvsName(gOvsSwitchContext, portName);
-    } else if (vportAttrs[OVS_VPORT_ATTR_PORT_NO] != NULL) {
-        vport = OvsFindVportByPortNo(gOvsSwitchContext,
-                    NlAttrGetU32(vportAttrs[OVS_VPORT_ATTR_PORT_NO]));
-    }
-
-    if (!vport) {
-        nlError = NL_ERROR_NODEV;
-        goto Cleanup;
-    }
-
-    /*
-     * XXX: when we implement OVS_DP_ATTR_USER_FEATURES in datapath,
-     * we'll need to check the OVS_DP_F_VPORT_PIDS flag: if it is set,
-     * it means we have an array of pids, instead of a single pid.
-     * Currently, we support only one pid.
-     */
-    if (vportAttrs[OVS_VPORT_ATTR_UPCALL_PID]) {
-        vport->upcallPid = NlAttrGetU32(vportAttrs[OVS_VPORT_ATTR_UPCALL_PID]);
-    }
-
-    if (vportAttrs[OVS_VPORT_ATTR_TYPE]) {
-        OVS_VPORT_TYPE type = NlAttrGetU32(vportAttrs[OVS_VPORT_ATTR_TYPE]);
-        if (type != vport->ovsType) {
-            nlError = NL_ERROR_INVAL;
-            goto Cleanup;
-        }
-    }
-
-    if (vportAttrs[OVS_VPORT_ATTR_OPTIONS]) {
-        OVS_LOG_ERROR("Vport options not supported");
-        nlError = NL_ERROR_NOTSUPP;
-        goto Cleanup;
-    }
-
-    status = OvsCreateMsgFromVport(vport, msgIn, usrParamsCtx->outputBuffer,
-                                   usrParamsCtx->outputLength,
-                                   gOvsSwitchContext->dpNo);
-
-    *replyLen = msgOut->nlMsg.nlmsgLen;
-
-Cleanup:
-    NdisReleaseRWLock(gOvsSwitchContext->dispatchLock, &lockState);
-    OvsReleaseCtrlLock();
-
-    if (nlError != NL_ERROR_SUCCESS) {
-        POVS_MESSAGE_ERROR msgError = (POVS_MESSAGE_ERROR)
-            usrParamsCtx->outputBuffer;
-
-        NlBuildErrorMsg(msgIn, msgError, nlError);
-        *replyLen = msgError->nlMsg.nlmsgLen;
-    }
-
-    return STATUS_SUCCESS;
-}
-
-/*
- * --------------------------------------------------------------------------
- *  Command Handler for 'OVS_VPORT_CMD_DEL'.
- * --------------------------------------------------------------------------
- */
+* --------------------------------------------------------------------------
+*  Command Handler for 'OVS_VPORT_CMD_DEL'.
+* --------------------------------------------------------------------------
+*/
 NTSTATUS
 OvsDeleteVportCmdHandler(POVS_USER_PARAMS_CONTEXT usrParamsCtx,
-                         UINT32 *replyLen)
+UINT32 *replyLen)
 {
-    NDIS_STATUS status = STATUS_SUCCESS;
-    LOCK_STATE_EX lockState;
+	NDIS_STATUS status = STATUS_SUCCESS;
+	LOCK_STATE_EX lockState;
 
-    POVS_MESSAGE msgIn = (POVS_MESSAGE)usrParamsCtx->inputBuffer;
-    POVS_MESSAGE msgOut = (POVS_MESSAGE)usrParamsCtx->outputBuffer;
-    POVS_VPORT_ENTRY vport = NULL;
-    NL_ERROR nlError = NL_ERROR_SUCCESS;
-    PSTR portName = NULL;
-    UINT32 portNameLen = 0;
+	POVS_MESSAGE msgIn = (POVS_MESSAGE)usrParamsCtx->inputBuffer;
+	POVS_MESSAGE msgOut = (POVS_MESSAGE)usrParamsCtx->outputBuffer;
+	POVS_VPORT_ENTRY vport = NULL;
+	NL_ERROR nlError = NL_ERROR_SUCCESS;
+	PSTR portName = NULL;
+	UINT32 portNameLen = 0;
 
-    static const NL_POLICY ovsVportPolicy[] = {
-        [OVS_VPORT_ATTR_PORT_NO] = { .type = NL_A_U32, .optional = TRUE },
-        [OVS_VPORT_ATTR_NAME] = { .type = NL_A_STRING, .maxLen = IFNAMSIZ,
-                                  .optional = TRUE },
-    };
-    PNL_ATTR vportAttrs[ARRAY_SIZE(ovsVportPolicy)];
+	static const NL_POLICY ovsVportPolicy[] = {
+		[OVS_VPORT_ATTR_PORT_NO] = { .type = NL_A_U32, .optional = TRUE },
+		[OVS_VPORT_ATTR_NAME] = { .type = NL_A_STRING, .maxLen = IFNAMSIZ,
+		.optional = TRUE },
+	};
+	PNL_ATTR vportAttrs[ARRAY_SIZE(ovsVportPolicy)];
 
-    ASSERT(usrParamsCtx->inputBuffer != NULL);
+	ASSERT(usrParamsCtx->inputBuffer != NULL);
 
-    if (!NlAttrParse((PNL_MSG_HDR)msgIn,
-        NLMSG_HDRLEN + GENL_HDRLEN + OVS_HDRLEN,
-        NlMsgAttrsLen((PNL_MSG_HDR)msgIn),
-        ovsVportPolicy, vportAttrs, ARRAY_SIZE(vportAttrs))) {
-        return STATUS_INVALID_PARAMETER;
-    }
+	if (!NlAttrParse((PNL_MSG_HDR)msgIn,
+		NLMSG_HDRLEN + GENL_HDRLEN + OVS_HDRLEN,
+		NlMsgAttrsLen((PNL_MSG_HDR)msgIn),
+		ovsVportPolicy, vportAttrs, ARRAY_SIZE(vportAttrs))) {
+		return STATUS_INVALID_PARAMETER;
+	}
 
-    /* Output buffer has been validated while validating transact dev op. */
-    ASSERT(msgOut != NULL && usrParamsCtx->outputLength >= sizeof *msgOut);
+	if (msgOut == NULL || usrParamsCtx->outputLength < sizeof *msgOut) {
+		return STATUS_NDIS_INVALID_LENGTH;
+	}
 
-    NdisAcquireRWLockWrite(gOvsSwitchContext->dispatchLock, &lockState, 0);
-    if (vportAttrs[OVS_VPORT_ATTR_NAME] != NULL) {
-        portName = NlAttrGet(vportAttrs[OVS_VPORT_ATTR_NAME]);
-        portNameLen = NlAttrGetSize(vportAttrs[OVS_VPORT_ATTR_NAME]);
+	NdisAcquireRWLockWrite(gOvsSwitchContext->dispatchLock, &lockState, 0);
+	if (vportAttrs[OVS_VPORT_ATTR_NAME] != NULL) {
+		portName = NlAttrGet(vportAttrs[OVS_VPORT_ATTR_NAME]);
+		portNameLen = NlAttrGetSize(vportAttrs[OVS_VPORT_ATTR_NAME]);
 
-        /* the port name is expected to be null-terminated */
-        ASSERT(portName[portNameLen - 1] == '\0');
+		/* the port name is expected to be null-terminated */
+		ASSERT(portName[portNameLen - 1] == '\0');
 
-        vport = OvsFindVportByOvsName(gOvsSwitchContext, portName);
-    }
-    else if (vportAttrs[OVS_VPORT_ATTR_PORT_NO] != NULL) {
-        vport = OvsFindVportByPortNo(gOvsSwitchContext,
-            NlAttrGetU32(vportAttrs[OVS_VPORT_ATTR_PORT_NO]));
-    }
+		vport = OvsFindVportByOvsName(gOvsSwitchContext, portName);
+	}
+	else if (vportAttrs[OVS_VPORT_ATTR_PORT_NO] != NULL) {
+		vport = OvsFindVportByPortNo(gOvsSwitchContext,
+			NlAttrGetU32(vportAttrs[OVS_VPORT_ATTR_PORT_NO]));
+	}
 
-    if (!vport) {
-        nlError = NL_ERROR_NODEV;
-        goto Cleanup;
-    }
+	if (!vport) {
+		nlError = NL_ERROR_NODEV;
+		goto Cleanup;
+	}
 
-    status = OvsCreateMsgFromVport(vport, msgIn, usrParamsCtx->outputBuffer,
-                                   usrParamsCtx->outputLength,
-                                   gOvsSwitchContext->dpNo);
+	status = OvsCreateMsgFromVport(vport, msgIn, usrParamsCtx->outputBuffer,
+		usrParamsCtx->outputLength,
+		gOvsSwitchContext->dpNo);
 
-    /*
-     * Mark the port as deleted from OVS userspace. If the port does not exist
-     * on the Hyper-V switch, it gets deallocated. Otherwise, it stays.
-     */
-    OvsRemoveAndDeleteVport(gOvsSwitchContext, vport, FALSE, TRUE, NULL);
+	if (vport->hvDeleted || OvsIsTunnelVportType(vport->ovsType)) {
+		/*
+		* The associated hyper-v switch port is not in created state, or,
+		* there is no hyper-v switch port counterpart (for logical ports).
+		* This means that this datapath port is not mapped to a living
+		* hyper-v switc hport. We can destroy and remove the vport from the
+		* list.
+		*/
+		OvsRemoveAndDeleteVport(gOvsSwitchContext, vport);
+	}
+	else {
+		/* The associated hyper-v switch port is in the created state, and the
+		* datapath port is mapped to a living hyper-v switch port. We cannot
+		* destroy the vport and cannot remove it from the list of vports.
+		* Instead, we mark the datapath (ovs) part of the vport as
+		* "not created", i.e. we set vport->portNo = OVS_PORT_NUMBER_INVALID.
+		*/
+		RemoveEntryList(&vport->ovsNameLink);
+		InitializeListHead(&vport->ovsNameLink);
+		RemoveEntryList(&vport->portNoLink);
+		InitializeListHead(&vport->portNoLink);
+		vport->portNo = OVS_DPPORT_NUMBER_INVALID;
+		vport->ovsName[0] = '\0';
+	}
 
-    *replyLen = msgOut->nlMsg.nlmsgLen;
+	*replyLen = msgOut->nlMsg.nlmsgLen;
 
 Cleanup:
-    NdisReleaseRWLock(gOvsSwitchContext->dispatchLock, &lockState);
+	NdisReleaseRWLock(gOvsSwitchContext->dispatchLock, &lockState);
 
-    if (nlError != NL_ERROR_SUCCESS) {
-        POVS_MESSAGE_ERROR msgError = (POVS_MESSAGE_ERROR)
-            usrParamsCtx->outputBuffer;
+	if (nlError != NL_ERROR_SUCCESS) {
+		POVS_MESSAGE_ERROR msgError = (POVS_MESSAGE_ERROR)
+			usrParamsCtx->outputBuffer;
 
-        NlBuildErrorMsg(msgIn, msgError, nlError);
-        *replyLen = msgError->nlMsg.nlmsgLen;
-    }
+		BuildErrorMsg(msgIn, msgError, nlError);
+		*replyLen = msgError->nlMsg.nlmsgLen;
+	}
 
-    return STATUS_SUCCESS;
+	return STATUS_SUCCESS;
 }

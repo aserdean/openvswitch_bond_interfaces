@@ -113,8 +113,55 @@ PDEVICE_OBJECT gDeviceObject;
 HANDLE gEngineHandle = NULL;
 UINT32 gCalloutIdV4;
 
+NTSTATUS
+OvsTunnelRegisterCallouts(VOID *deviceObject);
+
 
 /* Callout driver implementation */
+
+NTSTATUS
+OvsTunnelEngineSubscribe(VOID* pContext,
+                         FWPM_SERVICE_STATE bfeState)
+{
+	//NT_ASSERT(pContext);
+
+	NTSTATUS                status = STATUS_SUCCESS;
+	UNREFERENCED_PARAMETER(pContext);
+
+	//HANDLE handle = NULL;
+
+	switch (bfeState)
+	{
+		case FWPM_SERVICE_RUNNING:
+		{
+//			status = OvsTunnelEngineOpen(&gEngineHandle);
+//			if (gEngineHandle) {
+//				OvsTunnelAddSystemProvider(gEngineHandle);
+//				OvsTunnelEngineClose(&gEngineHandle);
+				status = OvsTunnelRegisterCallouts(gDeviceObject);
+//			}
+		}
+		case FWPM_SERVICE_STOPPED:
+		{
+			OVS_LOG_ERROR("FWPM_SERVICE_STOPPED triggered");
+		}
+		case FWPM_SERVICE_START_PENDING:
+		{
+			OVS_LOG_ERROR("FWPM_SERVICE_START_PENDING triggered");
+		}
+		case FWPM_SERVICE_STOP_PENDING:
+		{
+			OVS_LOG_ERROR("FWPM_SERVICE_STOP_PENDING triggered");
+		}
+	}
+
+	if (!NT_SUCCESS(status))
+	{
+		OVS_LOG_ERROR("Fail to open filtering engine session, status: %x.",
+			status);
+	}
+	return status;
+}
 
 NTSTATUS
 OvsTunnelEngineOpen(HANDLE *handle)
@@ -131,12 +178,13 @@ OvsTunnelEngineOpen(HANDLE *handle)
     session.txnWaitTimeoutInMSec = INFINITE;
     session.flags = FWPM_SESSION_FLAG_DYNAMIC;
 
-    /* The authentication service should always be RPC_C_AUTHN_DEFAULT. */
-    status = FwpmEngineOpen(NULL,
-                            RPC_C_AUTHN_DEFAULT,
-                            NULL,
-                            &session,
-                            handle);
+	/* The authentication service should always be RPC_C_AUTHN_DEFAULT. */
+	status = FwpmEngineOpen(NULL,
+			                RPC_C_AUTHN_DEFAULT,
+							NULL,
+							&session,
+							handle);
+
     if (!NT_SUCCESS(status)) {
         OVS_LOG_ERROR("Fail to open filtering engine session, status: %x.",
                       status);
@@ -429,6 +477,8 @@ OvsTunnelRegisterCallouts(VOID *deviceObject)
         goto Exit;
     }
     engineOpened = TRUE;
+	
+	OvsTunnelAddSystemProvider(gEngineHandle);
 
     status = FwpmTransactionBegin(gEngineHandle, 0);
     if (!NT_SUCCESS(status)) {
@@ -449,9 +499,13 @@ OvsTunnelRegisterCallouts(VOID *deviceObject)
      * installed on a computer, this makes it easy to determine who added what.
      */
     OvsTunnelSubLayer.providerKey = (GUID*) &OVS_TUNNEL_PROVIDER_KEY;
-
-    status = FwpmSubLayerAdd(gEngineHandle, &OvsTunnelSubLayer, NULL);
-    if (!NT_SUCCESS(status)) {
+	//ASSERT(KeGetCurrentIrql() == PASSIVE_LEVEL)
+	status = FwpmSubLayerAdd(gEngineHandle, &OvsTunnelSubLayer, NULL);
+	if (!NT_SUCCESS(status)) {
+		OVS_LOG_ERROR("FwpmSubLayerAdd, status: %x.", status);
+		KIRQL CurrentIrql;
+		CurrentIrql = KeGetCurrentIrql(); 
+		OVS_LOG_ERROR("current IRQL: %d\n", CurrentIrql);
         goto Exit;
     }
 
@@ -525,7 +579,12 @@ OvsTunnelFilterInitialize(PDRIVER_OBJECT driverObject)
         goto Exit;
     }
 
-    status = OvsTunnelRegisterCallouts(gDeviceObject);
+	if (FwpmBfeStateGet() == FWPM_SERVICE_RUNNING) {
+		status = OvsTunnelRegisterCallouts(gDeviceObject);
+	}
+	else {
+		status = STATUS_SUCCESS;
+	}
 
 Exit:
 

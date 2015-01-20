@@ -1416,7 +1416,7 @@ OvsActionsExecute(POVS_SWITCH_CONTEXT switchContext,
 
             if (ovsFwdCtx.destPortsSizeOut > 0 || ovsFwdCtx.tunnelTxNic != NULL
                 || ovsFwdCtx.tunnelRxNic != NULL) {
-                status = OvsOutputBeforeSetAction(&ovsFwdCtx);
+                //status = OvsOutputBeforeSetAction(&ovsFwdCtx);
                 if (status != NDIS_STATUS_SUCCESS) {
                     dropReason = L"OVS-adding destination failed";
                     goto dropit;
@@ -1433,6 +1433,7 @@ OvsActionsExecute(POVS_SWITCH_CONTEXT switchContext,
                  * guest tag-in-tag case as well as OVS rules that specify
                  * tag-in-tag.
                  */
+				ASSERT(vlanTagValue == NULL);
             } else {
                  vlanTagValue = 0;
                  vlanTag = (PNDIS_NET_BUFFER_LIST_8021Q_INFO)(PVOID *)&vlanTagValue;
@@ -1450,7 +1451,7 @@ OvsActionsExecute(POVS_SWITCH_CONTEXT switchContext,
         {
             if (ovsFwdCtx.destPortsSizeOut > 0 || ovsFwdCtx.tunnelTxNic != NULL
                 || ovsFwdCtx.tunnelRxNic != NULL) {
-                status = OvsOutputBeforeSetAction(&ovsFwdCtx);
+                //status = OvsOutputBeforeSetAction(&ovsFwdCtx);
                 if (status != NDIS_STATUS_SUCCESS) {
                     dropReason = L"OVS-adding destination failed";
                     goto dropit;
@@ -1520,7 +1521,7 @@ OvsActionsExecute(POVS_SWITCH_CONTEXT switchContext,
         {
             if (ovsFwdCtx.destPortsSizeOut > 0 || ovsFwdCtx.tunnelTxNic != NULL
                 || ovsFwdCtx.tunnelRxNic != NULL) {
-                status = OvsOutputBeforeSetAction(&ovsFwdCtx);
+                //status = OvsOutputBeforeSetAction(&ovsFwdCtx);
                 if (status != NDIS_STATUS_SUCCESS) {
                     dropReason = L"OVS-adding destination failed";
                     goto dropit;
@@ -1558,6 +1559,11 @@ dropit:
      * If curNbl != NULL, it implies the NBL has not been not freed up so far.
      */
     if (ovsFwdCtx.curNbl) {
+		//PNET_BUFFER_LIST parent = ovsFwdCtx.curNbl->ParentNetBufferList;
+	//	if (parent != NULL) {
+//			POVS_BUFFER_CONTEXT ctx = (POVS_BUFFER_CONTEXT)NET_BUFFER_LIST_CONTEXT_DATA_START(parent);
+		//	ASSERT(ctx && ctx->magic == OVS_CTX_MAGIC);
+		//}
         OvsCompleteNBLForwardingCtx(&ovsFwdCtx, dropReason);
     }
 

@@ -16,6 +16,7 @@
 
 #ifndef __TUNNEL_INTF_H_
 #define __TUNNEL_INTF_H_ 1
+#include <fwpmk.h>
 
 /* Tunnel callout driver load/unload functions */
 NTSTATUS OvsTunnelFilterInitialize(PDRIVER_OBJECT driverObject);
@@ -23,6 +24,10 @@ NTSTATUS OvsTunnelFilterInitialize(PDRIVER_OBJECT driverObject);
 VOID OvsTunnelFilterUninitialize(PDRIVER_OBJECT driverObject);
 
 NTSTATUS OvsTunnelEngineOpen(HANDLE *handle);
+
+NTSTATUS
+OvsTunnelEngineSubscribe(VOID* pContext,
+                         FWPM_SERVICE_STATE bfeState);
 
 VOID OvsTunnelEngineClose(HANDLE *handle);
 

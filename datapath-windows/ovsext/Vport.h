@@ -18,6 +18,7 @@
 #define __VPORT_H_ 1
 
 #include "Switch.h"
+#include "Datapath.h"
 
 #define OVS_MAX_DPPORTS             MAXUINT16
 #define OVS_DPPORT_NUMBER_INVALID   OVS_MAX_DPPORTS
@@ -69,7 +70,7 @@ typedef struct _OVS_VPORT_ERR_STATS {
     UINT64  rxDropped;
     UINT64  txDropped;
 } OVS_VPORT_ERR_STATS;
-
+#define MAC_ADDRESS_LEN 6
 /* used for vport netlink commands. */
 typedef struct _OVS_VPORT_FULL_STATS {
     OVS_VPORT_STATS;
@@ -102,9 +103,9 @@ typedef struct _OVS_VPORT_ENTRY {
     NDIS_SWITCH_NIC_STATE  nicState;
     NDIS_SWITCH_PORT_TYPE  portType;
 
-    UINT8                  permMacAddress[ETH_ADDR_LEN];
-    UINT8                  currMacAddress[ETH_ADDR_LEN];
-    UINT8                  vmMacAddress[ETH_ADDR_LEN];
+    UINT8                  permMacAddress[MAC_ADDRESS_LEN];
+    UINT8                  currMacAddress[MAC_ADDRESS_LEN];
+    UINT8                  vmMacAddress[MAC_ADDRESS_LEN];
 
     NDIS_SWITCH_PORT_NAME  hvPortName;
     IF_COUNTED_STRING      portFriendlyName;
@@ -129,8 +130,7 @@ typedef struct _OVS_VPORT_ENTRY {
     BOOLEAN                isExternal;
     UINT32                 upcallPid; /* netlink upcall port id */
     PNL_ATTR               portOptions;
-    BOOLEAN                isPresentOnHv; /* Is this port present on the
-                                             Hyper-V switch? */
+    BOOLEAN                hvDeleted; /* is the hyper-v switch port deleted? */
 } OVS_VPORT_ENTRY, *POVS_VPORT_ENTRY;
 
 struct _OVS_SWITCH_CONTEXT;
@@ -140,13 +140,15 @@ OvsFindVportByPortNo(struct _OVS_SWITCH_CONTEXT *switchContext,
                      UINT32 portNo);
 
 /* "name" is null-terminated */
-POVS_VPORT_ENTRY OvsFindVportByOvsName(POVS_SWITCH_CONTEXT switchContext,
-                                       PSTR name);
-POVS_VPORT_ENTRY OvsFindVportByHvNameA(POVS_SWITCH_CONTEXT switchContext,
-                                       PSTR name);
-POVS_VPORT_ENTRY OvsFindVportByPortIdAndNicIndex(POVS_SWITCH_CONTEXT switchContext,
-                                                 NDIS_SWITCH_PORT_ID portId,
-                                                 NDIS_SWITCH_NIC_INDEX index);
+POVS_VPORT_ENTRY
+OvsFindVportByOvsName(POVS_SWITCH_CONTEXT switchContext,
+                      PSTR name);
+POVS_VPORT_ENTRY
+OvsFindVportByHvName(POVS_SWITCH_CONTEXT switchContext, PSTR name);
+POVS_VPORT_ENTRY
+OvsFindVportByPortIdAndNicIndex(struct _OVS_SWITCH_CONTEXT *switchContext,
+                                NDIS_SWITCH_PORT_ID portId,
+                                NDIS_SWITCH_NIC_INDEX index);
 
 NDIS_STATUS OvsAddConfiguredSwitchPorts(struct _OVS_SWITCH_CONTEXT *switchContext);
 NDIS_STATUS OvsInitConfiguredSwitchNics(struct _OVS_SWITCH_CONTEXT *switchContext);
@@ -171,7 +173,17 @@ VOID HvDeleteNic(POVS_SWITCH_CONTEXT switchContext,
                  PNDIS_SWITCH_NIC_PARAMETERS nicParam);
 VOID HvDisconnectNic(POVS_SWITCH_CONTEXT switchContext,
                      PNDIS_SWITCH_NIC_PARAMETERS nicParam);
-
+NTSTATUS OvsGetVportCmdHandler(POVS_USER_PARAMS_CONTEXT usrParamsCtx,
+UINT32 *replyLen);
+NTSTATUS
+OvsSetVportCmdHandler(POVS_USER_PARAMS_CONTEXT usrParamsCtx,
+UINT32 *replyLen);
+NTSTATUS
+OvsNewVportCmdHandler(POVS_USER_PARAMS_CONTEXT usrParamsCtx,
+UINT32 *replyLen);
+NTSTATUS
+OvsDeleteVportCmdHandler(POVS_USER_PARAMS_CONTEXT usrParamsCtx,
+UINT32 *replyLen);
 static __inline BOOLEAN
 OvsIsTunnelVportType(OVS_VPORT_TYPE ovsType)
 {
@@ -208,10 +220,10 @@ OvsIsBridgeInternalVport(POVS_VPORT_ENTRY vport)
 }
 
 VOID OvsRemoveAndDeleteVport(POVS_SWITCH_CONTEXT switchContext,
-                             POVS_VPORT_ENTRY vport,
-                             BOOLEAN hvDelete, BOOLEAN ovsDelete,
-                             BOOLEAN *vportDeallocated);
+                             POVS_VPORT_ENTRY vport);
 
+NDIS_STATUS InitHvVportCommon(POVS_SWITCH_CONTEXT switchContext,
+                              POVS_VPORT_ENTRY vport);
 NDIS_STATUS InitOvsVportCommon(POVS_SWITCH_CONTEXT switchContext,
                                POVS_VPORT_ENTRY vport);
 NTSTATUS OvsInitTunnelVport(POVS_VPORT_ENTRY vport, OVS_VPORT_TYPE ovsType,

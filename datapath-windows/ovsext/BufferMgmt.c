@@ -1363,14 +1363,18 @@ OvsCompleteNBL(POVS_SWITCH_CONTEXT context,
 {
     POVS_BUFFER_CONTEXT ctx;
     UINT16 flags;
-    PNET_BUFFER_LIST parent;
+	PNET_BUFFER_LIST parent = nbl->ParentNetBufferList;
     NDIS_STATUS status;
     NDIS_HANDLE poolHandle;
     LONG value;
     POVS_NBL_POOL ovsPool = &context->ovsPool;
     PNET_BUFFER nb;
-
-
+	/*
+	if (parent != NULL) {
+		ctx = (POVS_BUFFER_CONTEXT)NET_BUFFER_LIST_CONTEXT_DATA_START(parent);
+		ASSERT(ctx && ctx->magic == OVS_CTX_MAGIC);
+	}
+	*/
     ctx = (POVS_BUFFER_CONTEXT)NET_BUFFER_LIST_CONTEXT_DATA_START(nbl);
 
     ASSERT(ctx && ctx->magic == OVS_CTX_MAGIC);
@@ -1485,7 +1489,7 @@ OvsCompleteNBL(POVS_SWITCH_CONTEXT context,
         ctx = (POVS_BUFFER_CONTEXT)NET_BUFFER_LIST_CONTEXT_DATA_START(parent);
         ASSERT(ctx && ctx->magic == OVS_CTX_MAGIC);
         value = InterlockedDecrement((LONG volatile *)&ctx->refCount);
-        if (value == 0) {
+		if (value == 0 || ctx->magic != OVS_CTX_MAGIC) {
             return OvsCompleteNBL(context, parent, FALSE);
         }
     }

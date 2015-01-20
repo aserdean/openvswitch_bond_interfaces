@@ -82,6 +82,11 @@ lockfile_name(const char *filename_)
      * symlink, not one for each. */
     filename = follow_symlinks(filename_);
     slash = strrchr(filename, '/');
+#ifdef _WIN32
+	if(slash == NULL) {
+    slash = strrchr(filename, '\\');
+    }
+#endif
     lockname = (slash
                 ? xasprintf("%.*s/.%s.~lock~",
                             (int) (slash - filename), filename, slash + 1)
@@ -253,11 +258,11 @@ lockfile_try_lock(const char *name, pid_t *pidp, struct lockfile **lockfilep)
     int fd;
 
     *pidp = 0;
-
-    fd = open(name, O_RDWR | O_CREAT, 0600);
+	
+    fd = open(name, _O_RDWR | _O_CREAT,  _S_IREAD | _S_IWRITE);
     if (fd < 0) {
         VLOG_WARN("%s: failed to open lock file: %s",
-                   name, ovs_strerror(errno));
+                   name, ovs_lasterror_to_string());
         return errno;
     }
 

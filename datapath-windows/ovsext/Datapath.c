@@ -317,6 +317,7 @@ static NTSTATUS InvokeNetlinkCmdHandler(POVS_USER_PARAMS_CONTEXT usrParamsCtx,
 /* Handles to the device object for communication with userspace. */
 NDIS_HANDLE gOvsDeviceHandle;
 PDEVICE_OBJECT gOvsDeviceObject;
+HANDLE gOvsBfe = NULL;
 
 _Dispatch_type_(IRP_MJ_CREATE)
 _Dispatch_type_(IRP_MJ_CLOSE)
@@ -353,29 +354,38 @@ PNDIS_SPIN_LOCK gOvsCtrlLock;
 VOID
 OvsInit()
 {
-    HANDLE handle = NULL;
+	NTSTATUS status = STATUS_SUCCESS;
 
     gOvsCtrlLock = &ovsCtrlLockObj;
     NdisAllocateSpinLock(gOvsCtrlLock);
     OvsInitEventQueue();
-
-    OvsTunnelEngineOpen(&handle);
-    if (handle) {
-        OvsTunnelAddSystemProvider(handle);
-    }
-    OvsTunnelEngineClose(&handle);
+	status = FwpmBfeStateSubscribeChanges(gOvsDeviceObject,
+		                                  OvsTunnelEngineSubscribe,
+		                                  NULL,
+										  &gOvsBfe);
+	if (!NT_SUCCESS(status)) {
+		OVS_LOG_ERROR("Fail to FwpmBfeStateSubscribeChanges, status:%x",
+			           status);
+	}
 }
 
 VOID
 OvsCleanup()
 {
     HANDLE handle = NULL;
+	NTSTATUS status = STATUS_SUCCESS;
 
     OvsCleanupEventQueue();
     if (gOvsCtrlLock) {
         NdisFreeSpinLock(gOvsCtrlLock);
         gOvsCtrlLock = NULL;
     }
+
+	status = FwpmBfeStateUnsubscribeChanges(gOvsBfe);
+	if (!NT_SUCCESS(status)) {
+		OVS_LOG_ERROR("Fail to FwpmBfeStateSubscribeChanges, status:%x",
+			status);
+	}
 
     OvsTunnelEngineOpen(&handle);
     if (handle) {
