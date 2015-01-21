@@ -75,7 +75,7 @@ AC_DEFUN([OVS_CHECK_WIN32],
               ;;
             *)
             PTHREAD_INCLUDES="-I$withval/include"
-            PTHREAD_LDFLAGS="-L$withval/lib/x86"
+            PTHREAD_LDFLAGS="-L$withval/"
             PTHREAD_LIBS="-lpthreadVC2"
             AC_SUBST([PTHREAD_INCLUDES])
             AC_SUBST([PTHREAD_LDFLAGS])
