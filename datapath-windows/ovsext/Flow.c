@@ -516,7 +516,7 @@ _FlowNlGetCmdHandler(POVS_USER_PARAMS_CONTEXT usrParamsCtx,
      * with our dpif-windows based interface. */
     rc = OvsGetFlowIoctl(&getInput, &getOutput);
     if (rc != STATUS_SUCCESS) {
-        OVS_LOG_ERROR("OvsGetFlowIoctl failed.");
+        OVS_LOG_ERROR("OvsGetFlowIoctl failed."); 
         goto done;
     }
 

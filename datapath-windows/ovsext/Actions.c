@@ -623,7 +623,10 @@ OvsTunnelPortTx(OvsForwardingContext *ovsFwdCtx)
     ovsFwdCtx->srcVportNo =
         ((POVS_VPORT_ENTRY)ovsFwdCtx->switchContext->internalVport)->portNo;
 
+	UINT32 tempSID = ovsFwdCtx->fwdDetail->SourcePortId;
     ovsFwdCtx->fwdDetail->SourcePortId = ovsFwdCtx->switchContext->internalPortId;
+
+	UINT32  tempNIC = ovsFwdCtx->fwdDetail->SourceNicIndex;
     ovsFwdCtx->fwdDetail->SourceNicIndex =
         ((POVS_VPORT_ENTRY)ovsFwdCtx->switchContext->internalVport)->nicIndex;
 
@@ -662,6 +665,8 @@ OvsTunnelPortTx(OvsForwardingContext *ovsFwdCtx)
         status = NDIS_STATUS_SUCCESS;
     }
 	ovsFwdCtx->srcVportNo = temp;
+	ovsFwdCtx->fwdDetail->SourceNicIndex = tempNIC;
+	ovsFwdCtx->fwdDetail->SourcePortId = tempSID;
     return status;
 }
 
@@ -1563,11 +1568,13 @@ dropit:
      */
     if (ovsFwdCtx.curNbl) {
 		//PNET_BUFFER_LIST parent = ovsFwdCtx.curNbl->ParentNetBufferList;
-	//	if (parent != NULL) {
-//			POVS_BUFFER_CONTEXT ctx = (POVS_BUFFER_CONTEXT)NET_BUFFER_LIST_CONTEXT_DATA_START(parent);
-		//	ASSERT(ctx && ctx->magic == OVS_CTX_MAGIC);
+		//if (parent != NULL) {
+			//POVS_BUFFER_CONTEXT ctx = (POVS_BUFFER_CONTEXT)NET_BUFFER_LIST_CONTEXT_DATA_START(parent);
+			//ASSERT(ctx && ctx->magic == OVS_CTX_MAGIC);
 		//}
-        OvsCompleteNBLForwardingCtx(&ovsFwdCtx, dropReason);
+		POVS_BUFFER_CONTEXT ctx = (POVS_BUFFER_CONTEXT)NET_BUFFER_LIST_CONTEXT_DATA_START(ovsFwdCtx.curNbl);
+		if (ctx->magic == OVS_CTX_MAGIC)
+			OvsCompleteNBLForwardingCtx(&ovsFwdCtx, dropReason);
     }
 
     return status;

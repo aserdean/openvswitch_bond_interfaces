@@ -1489,7 +1489,10 @@ OvsCompleteNBL(POVS_SWITCH_CONTEXT context,
         ctx = (POVS_BUFFER_CONTEXT)NET_BUFFER_LIST_CONTEXT_DATA_START(parent);
         ASSERT(ctx && ctx->magic == OVS_CTX_MAGIC);
 		if (ctx->magic != OVS_CTX_MAGIC)
+		{
+			//NdisFreeMemory(NULL, 200, 0);
 			return NULL;
+		}
         value = InterlockedDecrement((LONG volatile *)&ctx->refCount);
 		if (value == 0 && ctx->magic == OVS_CTX_MAGIC) {
             return OvsCompleteNBL(context, parent, FALSE);
