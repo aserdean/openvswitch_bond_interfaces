@@ -143,9 +143,10 @@ nl_sock_create(int protocol, struct nl_sock **sockp)
 #ifdef _WIN32
     sock->handle = CreateFile(OVS_DEVICE_NAME_USER,
                               GENERIC_READ | GENERIC_WRITE,
-                              FILE_SHARE_READ | FILE_SHARE_WRITE,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE | 
+							  FILE_SHARE_DELETE,
                               NULL, OPEN_EXISTING,
-                              FILE_FLAG_OVERLAPPED, NULL);
+                              FILE_FLAG_OVERLAPPED | FILE_FLAG_DELETE_ON_CLOSE, NULL);
 
     if (sock->handle == INVALID_HANDLE_VALUE) {
         VLOG_ERR("fcntl: %s", ovs_lasterror_to_string());
@@ -263,7 +264,11 @@ nl_sock_destroy(struct nl_sock *sock)
         if (sock->overlapped.hEvent) {
             CloseHandle(sock->overlapped.hEvent);
         }
-        CloseHandle(sock->handle);
+        DWORD lastError = CloseHandle(sock->handle);
+		if(lastError) {
+		VLOG_ERR("fcntl: %s", ovs_lasterror_to_string());
+		sock->handle = NULL;
+		}
 #else
         close(sock->fd);
 #endif
@@ -310,6 +315,9 @@ get_sock_pid_from_kernel(struct nl_sock *sock)
                          ofpbuf_data(txn.request), ofpbuf_size(txn.request),
                          ofpbuf_data(txn.reply), ofpbuf_size(txn.reply),
                          &bytes, NULL)) {
+		DWORD lastError = GetLastError();
+		ovs_assert(lastError != ERROR_NOT_READY);
+		VLOG_ERR("fcntl: %s", ovs_lasterror_to_string());
         retval = EINVAL;
         goto done;
     } else {
@@ -508,6 +516,9 @@ nl_sock_send__(struct nl_sock *sock, const struct ofpbuf *msg,
         if (!DeviceIoControl(sock->handle, OVS_IOCTL_WRITE,
                              ofpbuf_data(msg), ofpbuf_size(msg), NULL, 0,
                              &bytes, NULL)) {
+			DWORD lastError = GetLastError();
+			ovs_assert(lastError != ERROR_NOT_READY);
+			VLOG_ERR("fcntl: %s", ovs_lasterror_to_string());
             retval = -1;
             /* XXX: Map to a more appropriate error based on GetLastError(). */
             errno = EINVAL;
@@ -600,6 +611,9 @@ nl_sock_recv__(struct nl_sock *sock, struct ofpbuf *buf, bool wait)
         DWORD bytes;
         if (!DeviceIoControl(sock->handle, sock->read_ioctl,
                              NULL, 0, tail, sizeof tail, &bytes, NULL)) {
+			DWORD lastError = GetLastError();
+			ovs_assert(lastError != ERROR_NOT_READY);
+			VLOG_ERR("fcntl: %s", ovs_lasterror_to_string());
             retval = -1;
             errno = EINVAL;
         } else {
@@ -834,6 +848,9 @@ nl_sock_transact_multiple__(struct nl_sock *sock,
                              reply_buf, sizeof reply_buf,
                              &reply_len, NULL)) {
             /* XXX: Map to a more appropriate error. */
+			DWORD lastError = GetLastError();
+			ovs_assert(lastError != ERROR_NOT_READY);
+			VLOG_ERR("fcntl: %s", ovs_lasterror_to_string());
             error = EINVAL;
             break;
         }
@@ -1214,6 +1231,9 @@ pend_io_request(struct nl_sock *sock)
         /* Check if the I/O got pended */
         if (error != ERROR_IO_INCOMPLETE && error != ERROR_IO_PENDING) {
             VLOG_ERR("nl_sock_wait failed - %s\n", ovs_format_message(error));
+			DWORD lastError = GetLastError();
+			ovs_assert(lastError != ERROR_NOT_READY);
+			VLOG_ERR("fcntl: %s", ovs_lasterror_to_string());
             retval = EINVAL;
             goto done;
         }

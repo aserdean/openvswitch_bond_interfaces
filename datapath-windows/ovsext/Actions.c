@@ -607,6 +607,7 @@ OvsTunnelPortTx(OvsForwardingContext *ovsFwdCtx)
 {
     NDIS_STATUS status = NDIS_STATUS_FAILURE;
     PNET_BUFFER_LIST newNbl = NULL;
+	PNET_BUFFER_LIST oldNbl = NULL;
 
     /*
      * Setup the source port to be the internal port to as to facilitate the
@@ -618,6 +619,7 @@ OvsTunnelPortTx(OvsForwardingContext *ovsFwdCtx)
             L"OVS-Dropped since internal port is absent");
         return NDIS_STATUS_FAILURE;
     }
+	UINT32 temp = ovsFwdCtx->srcVportNo;
     ovsFwdCtx->srcVportNo =
         ((POVS_VPORT_ENTRY)ovsFwdCtx->switchContext->internalVport)->portNo;
 
@@ -628,6 +630,7 @@ OvsTunnelPortTx(OvsForwardingContext *ovsFwdCtx)
     /* Do the encap. Encap function does not consume the NBL. */
     switch(ovsFwdCtx->tunnelTxNic->ovsType) {
     case OVS_VPORT_TYPE_VXLAN:
+		oldNbl = ovsFwdCtx->curNbl;
         status = OvsEncapVxlan(ovsFwdCtx->curNbl, &ovsFwdCtx->tunKey,
                                ovsFwdCtx->switchContext,
                                (VOID *)ovsFwdCtx->completionList,
@@ -642,6 +645,7 @@ OvsTunnelPortTx(OvsForwardingContext *ovsFwdCtx)
 
     if (status == NDIS_STATUS_SUCCESS) {
         ASSERT(newNbl);
+		//ovsFwdCtx->curNbl = oldNbl;
         OvsCompleteNBLForwardingCtx(ovsFwdCtx,
                                     L"Complete after cloning NBL for encapsulation");
         ovsFwdCtx->curNbl = newNbl;
@@ -657,7 +661,7 @@ OvsTunnelPortTx(OvsForwardingContext *ovsFwdCtx)
         ovsActionStats.failedEncap++;
         status = NDIS_STATUS_SUCCESS;
     }
-
+	ovsFwdCtx->srcVportNo = temp;
     return status;
 }
 
@@ -768,7 +772,7 @@ OvsOutputForwardingCtx(OvsForwardingContext *ovsFwdCtx)
 
     /*
      * Handle the case where the some of the destination ports are tunneled
-     * ports - the non-tunneled ports get a unmodified copy of the NBL, and the
+     * ports - the non-tunneled ports get a unmodified copy oOvsOutputForwardingCtxf the NBL, and the
      * tunneling pipeline starts when we output the packet to tunneled port.
      */
     if (ovsFwdCtx->destPortsSizeOut > 0) {
@@ -778,7 +782,7 @@ OvsOutputForwardingCtx(OvsForwardingContext *ovsFwdCtx)
             ovsFwdCtx->fwdDetail->NumAvailableDestinations -
             (ovsFwdCtx->destPortsSizeIn - ovsFwdCtx->destPortsSizeOut);
 
-        ASSERT(ovsFwdCtx->destinationPorts != NULL);
+        //ASSERT(ovsFwdCtx->destinationPorts != NULL);
 
         /*
          * Create a copy of the packet in order to do encap on it later. Also,
@@ -799,7 +803,7 @@ OvsOutputForwardingCtx(OvsForwardingContext *ovsFwdCtx)
         }
 
         /* It does not seem like we'll get here unless 'portsToUpdate' > 0. */
-        ASSERT(portsToUpdate > 0);
+        //ASSERT(portsToUpdate > 0);
         status = switchContext->NdisSwitchHandlers.UpdateNetBufferListDestinations(
             switchContext->NdisSwitchContext, ovsFwdCtx->curNbl,
             portsToUpdate, ovsFwdCtx->destinationPorts);
@@ -809,23 +813,22 @@ OvsOutputForwardingCtx(OvsForwardingContext *ovsFwdCtx)
             dropReason = L"Dropped due to failure to update destinations.";
             goto dropit;
         }
-
-        OvsSendNBLIngress(ovsFwdCtx->switchContext, ovsFwdCtx->curNbl,
-                          ovsFwdCtx->sendFlags);
-        /* End this pipeline by resetting the corresponding context. */
-        ovsFwdCtx->destPortsSizeOut = 0;
-        ovsFwdCtx->curNbl = NULL;
+			OvsSendNBLIngress(ovsFwdCtx->switchContext, ovsFwdCtx->curNbl,
+				ovsFwdCtx->sendFlags);
+			/* End this pipeline by resetting the corresponding context. */
+			ovsFwdCtx->destPortsSizeOut = 0;
+			ovsFwdCtx->curNbl = NULL;
         if (newNbl) {
-            status = OvsInitForwardingCtx(ovsFwdCtx, ovsFwdCtx->switchContext,
-                                          newNbl, ovsFwdCtx->srcVportNo, 0,
-                                          NET_BUFFER_LIST_SWITCH_FORWARDING_DETAIL(newNbl),
-                                          ovsFwdCtx->completionList,
-                                          &ovsFwdCtx->layers, FALSE);
-            if (status != NDIS_STATUS_SUCCESS) {
-                dropReason = L"Dropped due to resouces.";
-                goto dropit;
-            }
-        }
+          status = OvsInitForwardingCtx(ovsFwdCtx, ovsFwdCtx->switchContext,
+                                        newNbl, ovsFwdCtx->srcVportNo, 0,
+                                        NET_BUFFER_LIST_SWITCH_FORWARDING_DETAIL(newNbl),
+                                        ovsFwdCtx->completionList,
+                                        &ovsFwdCtx->layers, FALSE);
+          if (status != NDIS_STATUS_SUCCESS) {
+              dropReason = L"Dropped due to resouces.";
+              goto dropit;
+          }
+       }
     }
 
     if (ovsFwdCtx->tunnelTxNic != NULL) {
@@ -1416,7 +1419,7 @@ OvsActionsExecute(POVS_SWITCH_CONTEXT switchContext,
 
             if (ovsFwdCtx.destPortsSizeOut > 0 || ovsFwdCtx.tunnelTxNic != NULL
                 || ovsFwdCtx.tunnelRxNic != NULL) {
-                //status = OvsOutputBeforeSetAction(&ovsFwdCtx);
+                status = OvsOutputBeforeSetAction(&ovsFwdCtx);
                 if (status != NDIS_STATUS_SUCCESS) {
                     dropReason = L"OVS-adding destination failed";
                     goto dropit;
@@ -1451,7 +1454,7 @@ OvsActionsExecute(POVS_SWITCH_CONTEXT switchContext,
         {
             if (ovsFwdCtx.destPortsSizeOut > 0 || ovsFwdCtx.tunnelTxNic != NULL
                 || ovsFwdCtx.tunnelRxNic != NULL) {
-                //status = OvsOutputBeforeSetAction(&ovsFwdCtx);
+                status = OvsOutputBeforeSetAction(&ovsFwdCtx);
                 if (status != NDIS_STATUS_SUCCESS) {
                     dropReason = L"OVS-adding destination failed";
                     goto dropit;
@@ -1521,7 +1524,7 @@ OvsActionsExecute(POVS_SWITCH_CONTEXT switchContext,
         {
             if (ovsFwdCtx.destPortsSizeOut > 0 || ovsFwdCtx.tunnelTxNic != NULL
                 || ovsFwdCtx.tunnelRxNic != NULL) {
-                //status = OvsOutputBeforeSetAction(&ovsFwdCtx);
+                status = OvsOutputBeforeSetAction(&ovsFwdCtx);
                 if (status != NDIS_STATUS_SUCCESS) {
                     dropReason = L"OVS-adding destination failed";
                     goto dropit;

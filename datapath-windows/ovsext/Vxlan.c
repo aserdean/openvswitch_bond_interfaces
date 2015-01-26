@@ -250,7 +250,7 @@ OvsEncapVxlan(PNET_BUFFER_LIST curNbl,
     status = OvsLookupIPFwdInfo(tunKey->dst, &fwdInfo);
     if (status != STATUS_SUCCESS) {
         OvsFwdIPHelperRequest(NULL, 0, tunKey, NULL, NULL, NULL);
-        // return NDIS_STATUS_PENDING;
+        //return NDIS_STATUS_PENDING;
         /*
          * XXX: Don't know if the completionList will make any sense when
          * accessed in the callback. Make sure the caveats are known.
