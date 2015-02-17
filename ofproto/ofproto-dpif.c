@@ -1065,7 +1065,8 @@ check_recirc(struct dpif_backer *backer)
     odp_flow_key_from_flow(&key, &flow, NULL, 0, true);
     enable_recirc = dpif_probe_feature(backer->dpif, "recirculation", &key,
                                        NULL);
-
+    enable_recirc = false;
+	
     if (enable_recirc) {
         VLOG_INFO("%s: Datapath supports recirculation",
                   dpif_name(backer->dpif));
@@ -1099,6 +1100,8 @@ check_ufid(struct dpif_backer *backer)
     dpif_flow_hash(backer->dpif, ofpbuf_data(&key), ofpbuf_size(&key), &ufid);
 
     enable_ufid = dpif_probe_feature(backer->dpif, "UFID", &key, &ufid);
+	
+	enable_ufid = false;
 
     if (enable_ufid) {
         VLOG_INFO("%s: Datapath supports userspace flow ids",
@@ -1212,6 +1215,9 @@ check_max_mpls_depth(struct dpif_backer *backer)
 
     VLOG_INFO("%s: MPLS label stack length probed as %d",
               dpif_name(backer->dpif), n);
+			  
+	n = 0;
+	
     return n;
 }
 
