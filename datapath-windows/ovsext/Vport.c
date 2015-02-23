@@ -25,6 +25,7 @@
 #include "Oid.h"
 #include "Datapath.h"
 
+
 #ifdef OVS_DBG_MOD
 #undef OVS_DBG_MOD
 #endif
@@ -65,6 +66,7 @@ static NTSTATUS CreateNetlinkMesgForNetdev(POVS_VPORT_EXT_INFO info,
                                            PVOID outBuffer,
                                            UINT32 outBufLen,
                                            int dpIfIndex);
+
 static VOID
 BuildMsgOut(POVS_MESSAGE msgIn, POVS_MESSAGE msgOut, UINT16 type,
 UINT32 length, UINT16 flags)
@@ -795,7 +797,7 @@ HvDisconnectNic(POVS_SWITCH_CONTEXT switchContext,
         OVS_LOG_WARN("Switch is not activated yet.");
         goto done;
     }
-    OvsAcuireCtrlLock();
+    OvsAcquireCtrlLock();
     NdisAcquireRWLockWrite(switchContext->dispatchLock, &lockState, 0);
     vport = OvsFindVportByPortIdAndNicIndex(switchContext,
                                             nicParam->PortId,
