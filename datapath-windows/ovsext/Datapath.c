@@ -354,26 +354,26 @@ PNDIS_SPIN_LOCK gOvsCtrlLock;
 VOID
 OvsInit()
 {
-	NTSTATUS status = STATUS_SUCCESS;
+    NTSTATUS status = STATUS_SUCCESS;
 
     gOvsCtrlLock = &ovsCtrlLockObj;
     NdisAllocateSpinLock(gOvsCtrlLock);
     OvsInitEventQueue();
-	status = FwpmBfeStateSubscribeChanges(gOvsDeviceObject,
-		                                  OvsTunnelEngineSubscribe,
-		                                  NULL,
-										  &gOvsBfe);
-	if (!NT_SUCCESS(status)) {
-		OVS_LOG_ERROR("Fail to FwpmBfeStateSubscribeChanges, status:%x",
-			           status);
-	}
+    status = FwpmBfeStateSubscribeChanges(gOvsDeviceObject,
+                                          OvsTunnelEngineSubscribe,
+                                          NULL,
+                                          &gOvsBfe);
+    if (!NT_SUCCESS(status)) {
+        OVS_LOG_ERROR("Fail to FwpmBfeStateSubscribeChanges, status:%x",
+                       status);
+    }
 }
 
 VOID
 OvsCleanup()
 {
     HANDLE handle = NULL;
-	NTSTATUS status = STATUS_SUCCESS;
+    NTSTATUS status = STATUS_SUCCESS;
 
     OvsCleanupEventQueue();
     if (gOvsCtrlLock) {
@@ -381,11 +381,11 @@ OvsCleanup()
         gOvsCtrlLock = NULL;
     }
 
-	status = FwpmBfeStateUnsubscribeChanges(gOvsBfe);
-	if (!NT_SUCCESS(status)) {
-		OVS_LOG_ERROR("Fail to FwpmBfeStateSubscribeChanges, status:%x",
-			status);
-	}
+    status = FwpmBfeStateUnsubscribeChanges(gOvsBfe);
+    if (!NT_SUCCESS(status)) {
+        OVS_LOG_ERROR("Fail to FwpmBfeStateSubscribeChanges, status:%x",
+            status);
+    }
 
     OvsTunnelEngineOpen(&handle);
     if (handle) {
