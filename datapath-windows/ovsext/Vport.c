@@ -69,7 +69,7 @@ static NTSTATUS CreateNetlinkMesgForNetdev(POVS_VPORT_EXT_INFO info,
 
 static VOID
 BuildMsgOut(POVS_MESSAGE msgIn, POVS_MESSAGE msgOut, UINT16 type,
-UINT32 length, UINT16 flags)
+            UINT32 length, UINT16 flags)
 {
     msgOut->nlMsg.nlmsgType = type;
     msgOut->nlMsg.nlmsgFlags = flags;
@@ -117,10 +117,10 @@ BuildErrorMsg(POVS_MESSAGE msgIn, POVS_MESSAGE_ERROR msgOut, UINT errorCode)
 }
 static NTSTATUS
 OvsCreateMsgFromVport(POVS_VPORT_ENTRY vport,
-POVS_MESSAGE msgIn,
-PVOID outBuffer,
-UINT32 outBufLen,
-int dpIfIndex)
+                      POVS_MESSAGE msgIn,
+                      PVOID outBuffer,
+                      UINT32 outBufLen,
+                      int dpIfIndex)
 {
     NL_BUFFER nlBuffer;
     OVS_VPORT_FULL_STATS vportStats;
@@ -196,7 +196,7 @@ int dpIfIndex)
 
 static NTSTATUS
 OvsGetVport(POVS_USER_PARAMS_CONTEXT usrParamsCtx,
-UINT32 *replyLen)
+            UINT32 *replyLen)
 {
     NTSTATUS status = STATUS_SUCCESS;
     LOCK_STATE_EX lockState;
@@ -279,7 +279,7 @@ Cleanup:
 }
 static NTSTATUS
 OvsGetVportDumpNext(POVS_USER_PARAMS_CONTEXT usrParamsCtx,
-UINT32 *replyLen)
+                    UINT32 *replyLen)
 {
     POVS_MESSAGE msgIn;
     POVS_OPEN_INSTANCE instance =
@@ -436,7 +436,6 @@ HvCreatePort(POVS_SWITCH_CONTEXT switchContext,
 
     VPORT_PORT_ENTER(portParam);
 
-    OvsAcquireCtrlLock();
     NdisAcquireRWLockWrite(switchContext->dispatchLock, &lockState, 0);
     vport = OvsFindVportByPortIdAndNicIndex(switchContext,
                                             portParam->PortId, 0);
@@ -456,7 +455,6 @@ HvCreatePort(POVS_SWITCH_CONTEXT switchContext,
 
 create_port_done:
     NdisReleaseRWLock(switchContext->dispatchLock, &lockState);
-    OvsReleaseCtrlLock();
     VPORT_PORT_EXIT(portParam);
     return status;
 }
@@ -475,7 +473,6 @@ HvUpdatePort(POVS_SWITCH_CONTEXT switchContext,
     NDIS_SWITCH_NIC_STATE nicState;
 
     VPORT_PORT_ENTER(portParam);
-    OvsAcquireCtrlLock();
     NdisAcquireRWLockWrite(switchContext->dispatchLock, &lockState, 0);
     vport = OvsFindVportByPortIdAndNicIndex(switchContext,
                                             portParam->PortId, 0);
@@ -512,7 +509,6 @@ HvUpdatePort(POVS_SWITCH_CONTEXT switchContext,
 
 update_port_done:
     NdisReleaseRWLock(switchContext->dispatchLock, &lockState);
-    OvsReleaseCtrlLock();
     VPORT_PORT_EXIT(portParam);
 
     /* Must always return success */
@@ -527,7 +523,6 @@ HvTeardownPort(POVS_SWITCH_CONTEXT switchContext,
     LOCK_STATE_EX lockState;
 
     VPORT_PORT_ENTER(portParam);
-    OvsAcquireCtrlLock();
     NdisAcquireRWLockWrite(switchContext->dispatchLock, &lockState, 0);
     vport = OvsFindVportByPortIdAndNicIndex(switchContext,
                                             portParam->PortId, 0);
@@ -540,7 +535,6 @@ HvTeardownPort(POVS_SWITCH_CONTEXT switchContext,
         OVS_LOG_WARN("Vport not present.");
     }
     NdisReleaseRWLock(switchContext->dispatchLock, &lockState);
-    OvsReleaseCtrlLock();
     VPORT_PORT_EXIT(portParam);
 }
 
@@ -554,7 +548,6 @@ HvDeletePort(POVS_SWITCH_CONTEXT switchContext,
     LOCK_STATE_EX lockState;
 
     VPORT_PORT_ENTER(portParams);
-    OvsAcquireCtrlLock();
     NdisAcquireRWLockWrite(switchContext->dispatchLock, &lockState, 0);
     vport = OvsFindVportByPortIdAndNicIndex(switchContext,
                                             portParams->PortId, 0);
@@ -575,7 +568,6 @@ HvDeletePort(POVS_SWITCH_CONTEXT switchContext,
         OVS_LOG_WARN("Vport not present.");
     }
     NdisReleaseRWLock(switchContext->dispatchLock, &lockState);
-    OvsReleaseCtrlLock();
     VPORT_PORT_EXIT(portParams);
 }
 
@@ -605,7 +597,6 @@ HvCreateNic(POVS_SWITCH_CONTEXT switchContext,
         status = NDIS_STATUS_NOT_SUPPORTED;
         goto done;
     }
-    OvsAcquireCtrlLock();
     NdisAcquireRWLockWrite(switchContext->dispatchLock, &lockState, 0);
     vport = OvsFindVportByPortIdAndNicIndex(switchContext, nicParam->PortId, 0);
     if (vport == NULL) {
@@ -643,7 +634,6 @@ HvCreateNic(POVS_SWITCH_CONTEXT switchContext,
 
 add_nic_done:
     NdisReleaseRWLock(switchContext->dispatchLock, &lockState);
-    OvsReleaseCtrlLock();
     if (portNo != OVS_DPPORT_NUMBER_INVALID && event) {
         OvsPostEvent(portNo, event);
     }
@@ -674,7 +664,6 @@ HvConnectNic(POVS_SWITCH_CONTEXT switchContext,
         OVS_LOG_WARN("Switch is not activated yet.");
         goto done;
     }
-    OvsAcquireCtrlLock();
     NdisAcquireRWLockWrite(switchContext->dispatchLock, &lockState, 0);
     vport = OvsFindVportByPortIdAndNicIndex(switchContext,
                                             nicParam->PortId,
@@ -692,7 +681,6 @@ HvConnectNic(POVS_SWITCH_CONTEXT switchContext,
     portNo = vport->portNo;
 
     NdisReleaseRWLock(switchContext->dispatchLock, &lockState);
-    OvsReleaseCtrlLock();
     /* XXX only if portNo != INVALID or always? */
     OvsPostEvent(portNo, OVS_EVENT_LINK_UP);
 
@@ -722,12 +710,12 @@ HvUpdateNic(POVS_SWITCH_CONTEXT switchContext,
         OVS_LOG_WARN("Switch is not activated yet.");
         goto update_nic_done;
     }
-    OvsAcquireCtrlLock();
     NdisAcquireRWLockWrite(switchContext->dispatchLock, &lockState, 0);
     vport = OvsFindVportByPortIdAndNicIndex(switchContext,
                                             nicParam->PortId,
                                             nicParam->NicIndex);
     if (vport == NULL) {
+        NdisReleaseRWLock(switchContext->dispatchLock, &lockState);
         OVS_LOG_WARN("Vport search failed.");
         goto update_nic_done;
     }
@@ -770,7 +758,6 @@ HvUpdateNic(POVS_SWITCH_CONTEXT switchContext,
     portNo = vport->portNo;
     
     NdisReleaseRWLock(switchContext->dispatchLock, &lockState);
-    OvsReleaseCtrlLock();
     if (status && portNo) {
         OvsPostEvent(portNo, status);
     }
@@ -797,7 +784,6 @@ HvDisconnectNic(POVS_SWITCH_CONTEXT switchContext,
         OVS_LOG_WARN("Switch is not activated yet.");
         goto done;
     }
-    OvsAcquireCtrlLock();
     NdisAcquireRWLockWrite(switchContext->dispatchLock, &lockState, 0);
     vport = OvsFindVportByPortIdAndNicIndex(switchContext,
                                             nicParam->PortId,
@@ -806,7 +792,6 @@ HvDisconnectNic(POVS_SWITCH_CONTEXT switchContext,
     if (!vport) {
         OVS_LOG_WARN("Vport not present.");
         NdisReleaseRWLock(switchContext->dispatchLock, &lockState);
-        OvsReleaseCtrlLock();
         goto done;
     }
 
@@ -819,7 +804,6 @@ HvDisconnectNic(POVS_SWITCH_CONTEXT switchContext,
     }
 
     NdisReleaseRWLock(switchContext->dispatchLock, &lockState);
-    OvsReleaseCtrlLock();
     /* XXX if portNo != INVALID or always? */
     OvsPostEvent(portNo, OVS_EVENT_LINK_DOWN);
 
@@ -848,7 +832,6 @@ HvDeleteNic(POVS_SWITCH_CONTEXT switchContext,
         OVS_LOG_WARN("Switch is not activated yet.");
         goto done;
     }
-    OvsAcquireCtrlLock();
     NdisAcquireRWLockWrite(switchContext->dispatchLock, &lockState, 0);
     vport = OvsFindVportByPortIdAndNicIndex(switchContext,
                                             nicParam->PortId,
@@ -869,7 +852,6 @@ HvDeleteNic(POVS_SWITCH_CONTEXT switchContext,
     vport->ovsState = OVS_STATE_PORT_CREATED;
 
     NdisReleaseRWLock(switchContext->dispatchLock, &lockState);
-    OvsReleaseCtrlLock();
     /* XXX if portNo != INVALID or always? */
     OvsPostEvent(portNo, OVS_EVENT_DISCONNECT);
 
@@ -1672,7 +1654,6 @@ OvsGetExtInfoIoctl(POVS_VPORT_GET vportGet,
     }
     NdisReleaseRWLock(gOvsSwitchContext->dispatchLock, &lockState);
     if (doConvert) {
-        NdisReleaseSpinLock(gOvsCtrlLock);
         status = OvsConvertIfCountedStrToAnsiStr(&vport->portFriendlyName,
                                                  extInfo->name,
                                                  OVS_MAX_PORT_NAME_LENGTH);
@@ -1700,7 +1681,6 @@ OvsGetExtInfoIoctl(POVS_VPORT_GET vportGet,
          * for now ignore status
          */
         status = STATUS_SUCCESS;
-        NdisAcquireSpinLock(gOvsCtrlLock);
     }
 
 ext_info_done:
@@ -2175,7 +2155,7 @@ Cleanup:
 */
 NTSTATUS
 OvsDeleteVportCmdHandler(POVS_USER_PARAMS_CONTEXT usrParamsCtx,
-UINT32 *replyLen)
+                         UINT32 *replyLen)
 {
     NDIS_STATUS status = STATUS_SUCCESS;
     LOCK_STATE_EX lockState;
