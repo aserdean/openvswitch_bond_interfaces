@@ -314,7 +314,7 @@ OvsGetVportDumpNext(POVS_USER_PARAMS_CONTEXT usrParamsCtx,
     */
     ASSERT(KeGetCurrentIrql() == DISPATCH_LEVEL);
     NdisAcquireRWLockRead(gOvsSwitchContext->dispatchLock, &lockState,
-        NDIS_RWL_AT_DISPATCH_LEVEL);
+        0);
 
     if (gOvsSwitchContext->numHvVports > 0 ||
         gOvsSwitchContext->numNonHvVports > 0) {
@@ -1602,7 +1602,7 @@ OvsGetExtInfoIoctl(POVS_VPORT_GET vportGet,
 
     RtlZeroMemory(extInfo, sizeof (POVS_VPORT_EXT_INFO));
     NdisAcquireRWLockRead(gOvsSwitchContext->dispatchLock, &lockState,
-                          NDIS_RWL_AT_DISPATCH_LEVEL);
+                          0);
     if (vportGet->portNo == 0) {
         StringCbLengthA(vportGet->name, OVS_MAX_PORT_NAME_LENGTH - 1, &len);
         vport = OvsFindVportByHvName(gOvsSwitchContext, vportGet->name);
