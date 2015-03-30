@@ -304,7 +304,7 @@ OvsGetVportDumpNext(POVS_USER_PARAMS_CONTEXT usrParamsCtx,
 
     msgIn = instance->dumpState.ovsMsg;
 
-    OvsAcquireCtrlLock();
+    //OvsAcquireCtrlLock();
 
     /*
     * XXX: when we implement OVS_DP_ATTR_USER_FEATURES in datapath,
@@ -375,7 +375,7 @@ OvsGetVportDumpNext(POVS_USER_PARAMS_CONTEXT usrParamsCtx,
 
     NdisReleaseRWLock(gOvsSwitchContext->dispatchLock, &lockState);
 
-    OvsReleaseCtrlLock();
+    //OvsReleaseCtrlLock();
 
     /* if i < OVS_MAX_VPORT_ARRAY_SIZE => vport was found */
     if (i < OVS_MAX_VPORT_ARRAY_SIZE) {
@@ -1725,7 +1725,7 @@ OvsGetNetdevCmdHandler(POVS_USER_PARAMS_CONTEXT usrParamsCtx,
         return STATUS_INVALID_PARAMETER;
     }
 
-    OvsAcquireCtrlLock();
+    //OvsAcquireCtrlLock();
 
     vportGet.portNo = 0;
     RtlCopyMemory(&vportGet.name, NlAttrGet(netdevAttrs[OVS_VPORT_ATTR_NAME]),
@@ -1734,7 +1734,7 @@ OvsGetNetdevCmdHandler(POVS_USER_PARAMS_CONTEXT usrParamsCtx,
     status = OvsGetExtInfoIoctl(&vportGet, &info);
     if (status == STATUS_DEVICE_DOES_NOT_EXIST) {
         nlError = NL_ERROR_NODEV;
-        OvsReleaseCtrlLock();
+        //OvsReleaseCtrlLock();
         goto cleanup;
     }
 
@@ -1744,7 +1744,7 @@ OvsGetNetdevCmdHandler(POVS_USER_PARAMS_CONTEXT usrParamsCtx,
     if (status == STATUS_SUCCESS) {
         *replyLen = msgOut->nlMsg.nlmsgLen;
     }
-    OvsReleaseCtrlLock();
+    //OvsReleaseCtrlLock();
 
 cleanup:
     if (nlError != NL_ERROR_SUCCESS) {
@@ -1893,7 +1893,7 @@ UINT32 *replyLen)
         return STATUS_NDIS_INVALID_LENGTH;
     }
 
-    OvsAcquireCtrlLock();
+    //OvsAcquireCtrlLock();
 
     NdisAcquireRWLockWrite(gOvsSwitchContext->dispatchLock, &lockState, 0);
     if (vportAttrs[OVS_VPORT_ATTR_NAME] != NULL) {
@@ -1948,7 +1948,7 @@ UINT32 *replyLen)
 
 Cleanup:
     NdisReleaseRWLock(gOvsSwitchContext->dispatchLock, &lockState);
-    OvsReleaseCtrlLock();
+    //OvsReleaseCtrlLock();
 
     if (nlError != NL_ERROR_SUCCESS) {
         POVS_MESSAGE_ERROR msgError = (POVS_MESSAGE_ERROR)

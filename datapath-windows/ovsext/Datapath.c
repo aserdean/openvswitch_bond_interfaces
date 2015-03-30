@@ -1526,8 +1526,6 @@ OvsReadEventCmdHandler(POVS_USER_PARAMS_CONTEXT usrParamsCtx,
 
     NlBufInit(&nlBuf, usrParamsCtx->outputBuffer, usrParamsCtx->outputLength);
 
-    OvsAcquireCtrlLock();
-
     /* remove an event entry from the event queue */
     status = OvsRemoveEventEntry(usrParamsCtx->ovsInstance, &eventEntry);
     if (status != STATUS_SUCCESS) {
@@ -1536,6 +1534,8 @@ OvsReadEventCmdHandler(POVS_USER_PARAMS_CONTEXT usrParamsCtx,
         *replyLen = 0;
         goto cleanup;
     }
+
+    OvsAcquireCtrlLock();
 
     status = OvsPortFillInfo(usrParamsCtx, &eventEntry, &nlBuf);
     if (status == NDIS_STATUS_SUCCESS) {
