@@ -1035,6 +1035,7 @@ check_ufid(struct dpif_backer *backer)
     dpif_flow_hash(backer->dpif, key.data, key.size, &ufid);
 
     enable_ufid = dpif_probe_feature(backer->dpif, "UFID", &key, &ufid);
+    enable_ufid = false;
 
     if (enable_ufid) {
         VLOG_INFO("%s: Datapath supports unique flow ids",
