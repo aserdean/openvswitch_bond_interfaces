@@ -1204,7 +1204,7 @@ OvsRemoveAndDeleteVport(PVOID usrParamsContext,
         (POVS_USER_PARAMS_CONTEXT)usrParamsContext;
     BOOLEAN hvSwitchPort = FALSE;
 
-    if (vport->isExternal) {
+    if (vport->isExternal && hvDelete) {
         if (vport->nicIndex == 0) {
             ASSERT(switchContext->numPhysicalNics == 0);
             switchContext->virtualExternalPortId = 0;
@@ -1220,7 +1220,7 @@ OvsRemoveAndDeleteVport(PVOID usrParamsContext,
 
     switch (vport->ovsType) {
     case OVS_VPORT_TYPE_INTERNAL:
-        if (!vport->isBridgeInternal) {
+        if (!vport->isBridgeInternal && hvDelete) {
             switchContext->internalPortId = 0;
             switchContext->internalVport = NULL;
             OvsInternalAdapterDown();
