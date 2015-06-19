@@ -274,7 +274,11 @@ OvsDoEncapVxlan(PNET_BUFFER_LIST curNbl,
         /* UDP header */
         udpHdr = (UDPHdr *)((PCHAR)ipHdr + sizeof *ipHdr);
         udpHdr->source = htons(tunKey->flow_hash | 32768);
-        udpHdr->dest = htons(tunKey->dst_port);
+        /* VXLAN port not read properly from the key switch to default port
+         * XXX uncomment below if read right
+         * udpHdr->dest = htons(tunKey->dst_port);
+         */
+        udpHdr->dest = htons(VXLAN_UDP_PORT);
         udpHdr->len = htons(NET_BUFFER_DATA_LENGTH(curNb) - headRoom +
                             sizeof *udpHdr + sizeof *vxlanHdr);
         udpHdr->check = 0;
