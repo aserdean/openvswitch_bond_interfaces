@@ -607,7 +607,7 @@ OvsDoFlowLookupOutput(OvsForwardingContext *ovsFwdCtx)
  * --------------------------------------------------------------------------
  */
 static __inline NDIS_STATUS
-OvsTunnelPortTx(OvsForwardingContext *ovsFwdCtx)
+OvsTunnelPortTx(OvsForwardingContext *ovsFwdCtx, BOOLEAN savePorts)
 {
     NDIS_STATUS status = NDIS_STATUS_FAILURE;
     PNET_BUFFER_LIST newNbl = NULL;
@@ -622,6 +622,11 @@ OvsTunnelPortTx(OvsForwardingContext *ovsFwdCtx)
             L"OVS-Dropped since internal port is absent");
         return NDIS_STATUS_FAILURE;
     }
+
+    UINT32 temp = ovsFwdCtx->srcVportNo;
+    UINT32 tempSID = ovsFwdCtx->fwdDetail->SourcePortId;
+    UINT32  tempNIC = ovsFwdCtx->fwdDetail->SourceNicIndex;
+
     ovsFwdCtx->srcVportNo =
         ((POVS_VPORT_ENTRY)ovsFwdCtx->switchContext->internalVport)->portNo;
 
@@ -660,6 +665,12 @@ OvsTunnelPortTx(OvsForwardingContext *ovsFwdCtx)
                                     L"OVS-Dropped due to encap failure");
         ovsActionStats.failedEncap++;
         status = NDIS_STATUS_SUCCESS;
+    }
+
+    if (savePorts) {
+        ovsFwdCtx->srcVportNo = temp;
+        ovsFwdCtx->fwdDetail->SourcePortId = tempSID;
+        ovsFwdCtx->fwdDetail->SourceNicIndex = tempNIC;
     }
 
     return status;
@@ -764,7 +775,7 @@ dropNbl:
  * --------------------------------------------------------------------------
  */
 static __inline NDIS_STATUS
-OvsOutputForwardingCtx(OvsForwardingContext *ovsFwdCtx)
+OvsOutputForwardingCtx(OvsForwardingContext *ovsFwdCtx, BOOLEAN savePorts)
 {
     NDIS_STATUS status = STATUS_SUCCESS;
     POVS_SWITCH_CONTEXT switchContext = ovsFwdCtx->switchContext;
@@ -833,7 +844,7 @@ OvsOutputForwardingCtx(OvsForwardingContext *ovsFwdCtx)
     }
 
     if (ovsFwdCtx->tunnelTxNic != NULL) {
-        status = OvsTunnelPortTx(ovsFwdCtx);
+        status = OvsTunnelPortTx(ovsFwdCtx, savePorts);
         ASSERT(ovsFwdCtx->tunnelTxNic == NULL);
         ASSERT(ovsFwdCtx->tunKey.dst == 0);
     } else if (ovsFwdCtx->tunnelRxNic != NULL) {
@@ -945,7 +956,7 @@ OvsOutputBeforeSetAction(OvsForwardingContext *ovsFwdCtx)
            ovsFwdCtx->tunnelTxNic != NULL || ovsFwdCtx->tunnelRxNic != NULL);
 
     /* Send the original packet out */
-    status = OvsOutputForwardingCtx(ovsFwdCtx);
+    status = OvsOutputForwardingCtx(ovsFwdCtx, TRUE);
     ASSERT(ovsFwdCtx->curNbl == NULL);
     ASSERT(ovsFwdCtx->destPortsSizeOut == 0);
     ASSERT(ovsFwdCtx->tunnelRxNic == NULL);
@@ -1319,7 +1330,7 @@ OvsExecuteSetAction(OvsForwardingContext *ovsFwdCtx,
     {
         OvsIPv4TunnelKey tunKey;
 
-		status = OvsTunnelAttrToIPv4TunnelKey((PNL_ATTR)a, &tunKey);
+        status = OvsTunnelAttrToIPv4TunnelKey((PNL_ATTR)a, &tunKey);
         ASSERT(status == NDIS_STATUS_SUCCESS);
         tunKey.flow_hash = (uint16)(hash ? *hash : OvsHashFlow(key));
         tunKey.dst_port = key->ipKey.l4.tpDst;
@@ -1550,7 +1561,7 @@ OvsActionsExecute(POVS_SWITCH_CONTEXT switchContext,
 
     if (ovsFwdCtx.destPortsSizeOut > 0 || ovsFwdCtx.tunnelTxNic != NULL
         || ovsFwdCtx.tunnelRxNic != NULL) {
-        status = OvsOutputForwardingCtx(&ovsFwdCtx);
+        status = OvsOutputForwardingCtx(&ovsFwdCtx, FALSE);
         ASSERT(ovsFwdCtx.curNbl == NULL);
     }
 
