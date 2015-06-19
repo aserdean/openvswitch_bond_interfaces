@@ -456,10 +456,12 @@ OvsTunnelRegisterCallouts(VOID *deviceObject)
         L"Sub-Layer for use by Datagram-Data OVS callouts";
     OvsTunnelSubLayer.flags = 0;
     OvsTunnelSubLayer.weight = FWP_EMPTY; /* auto-weight */
-
+    OvsTunnelSubLayer.providerKey = (GUID*)&OVS_TUNNEL_PROVIDER_KEY;
     status = FwpmSubLayerAdd(gEngineHandle, &OvsTunnelSubLayer, NULL);
     if (!NT_SUCCESS(status)) {
-        goto Exit;
+        if (STATUS_FWP_ALREADY_EXISTS != status){
+            goto Exit;
+        }
     }
 
     /* In order to use this callout a socket must be opened. */
@@ -468,7 +470,9 @@ OvsTunnelRegisterCallouts(VOID *deviceObject)
                                                    deviceObject,
                                                    &gCalloutIdV4);
     if (!NT_SUCCESS(status)) {
-        goto Exit;
+        if (STATUS_FWP_ALREADY_EXISTS != status){
+            goto Exit;
+        }
     }
 
     status = FwpmTransactionCommit(gEngineHandle);
